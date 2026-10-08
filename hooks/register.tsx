@@ -26,6 +26,10 @@ type Ledger = Record<string, Record<string, Row>> // day -> model -> totals
 
 const runs = atom({ plugin: 'model-router', key: 'runs' } as const, [])
 const reviewing = atom({ plugin: 'model-router', key: 'reviewing' } as const, 0)
+const today = atom({ plugin: 'model-router', key: 'today' } as const, {})
+const lastReview = atom({ plugin: 'model-router', key: 'lastReview' } as const, '')
+const PANE = 'model-router'
+let isPaneShown = false // module state: a reload reopens the pane once
 
 let ledger: Ledger = {}
 const files = new Map<string, Set<string>>() // running coder agentId -> files it edits
@@ -34,7 +38,8 @@ const agentOf = new Map<string, string>() // Agent tool_use_id -> coder agentId
 
 const day = () => new Date().toISOString().slice(0, 10)
 const short = (model: string) => model.replace(/^claude-/, '').split('-')[0] ?? model
-const k = (n: number) => (n >= 1000 ? `${Math.round(n / 1000)}k` : String(n))
+const k = (n: number) =>
+  n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${Math.round(n / 1000)}k` : String(n)
 const base = (path: string) => path.slice(path.lastIndexOf('/') + 1)
 const totals = () =>
   Object.fromEntries(Object.entries(ledger[day()] ?? {}).map(([m, r]) => [short(m), r.input + r.output]))
@@ -51,6 +56,7 @@ async function meter($: EngineInterface, model: string, u: ModelUsage) {
   row.cacheRead += u.cache_read_input_tokens
   row.cacheWrite += u.cache_creation_input_tokens
   $.ui.status(usageLine())
+  await update($, today, () => totals())
   await $.store.set('usage', ledger)
 }
 
@@ -68,17 +74,38 @@ async function changeOf($: EngineInterface, paths: string[]) {
 }
 
 function report(days: Ledger) {
-  const lines = ['| day | model | calls | input | output | cache read | cache write |', '|---|---|---|---|---|---|---|']
+  const lines = ['| day | model | calls | input | output | cache read | cache write |', '|---|---|--:|--:|--:|--:|--:|']
   for (const [d, models] of Object.entries(days).sort().reverse())
     for (const [m, r] of Object.entries(models))
-      lines.push(`| ${d} | ${m} | ${r.calls} | ${r.input} | ${r.output} | ${r.cacheRead} | ${r.cacheWrite} |`)
-  return lines.length > 2 ? lines.join('\n') : 'No usage recorded yet.'
+      lines.push(`| ${d} | ${short(m)} | ${r.calls} | ${k(r.input)} | ${k(r.output)} | ${k(r.cacheRead)} | ${k(r.cacheWrite)} |`)
+  return lines.length > 2 ? `**Token usage per model**\n\n${lines.join('\n')}` : 'No usage recorded yet.'
+}
+
+async function card($: EngineInterface) {
+  const list = await read($, runs)
+  const n = await read($, reviewing)
+  const last = await read($, lastReview)
+  const usage = Object.entries(await read($, today)).map(([m, v]) => `${m} ${k(v)}`).join(' · ') || 'no usage yet'
+  return [
+    '**● model-router active**',
+    '',
+    '| role | model |',
+    '|---|---|',
+    '| main chat | Opus 5.5 · high |',
+    `| edits | Haiku 5.5 · ${list.length} coder${list.length === 1 ? '' : 's'} running |`,
+    `| review | Sonnet 5.5${n > 0 ? ` · reviewing ${n}` : ''} |`,
+    '',
+    `**Today:** ${usage}`,
+    ...list.map(run => `- haiku ▸ ${run.task}${run.files.length > 0 ? ` (${run.files.map(base).join(', ')})` : ''}`),
+    ...(last !== '' ? ['', `**Last review:** ${last}`] : []),
+  ].join('\n')
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     ledger = ((await $.store.get('usage')) ?? {}) as Ledger
     $.ui.status(usageLine())
+    await update($, today, () => totals())
     await $.agent.register({
       name: 'coder',
       description: `Haiku 5.5 coder: makes ALL file edits (the main chat cannot edit). The prompt must be a handoff document (${HANDOFF.join(', ')}). Spawn several in one message to work in parallel on disjoint files.`,
@@ -88,6 +115,14 @@ export const register: Register = on => {
       disallowedTools: ['Agent'],
     })
     await $.command.register({ name: 'router-usage', description: 'Token usage per model and day (model-router)' })
+    await $.command.register({ name: 'router', description: 'Open the model-router pane' })
+    isPaneShown = (await $.ui.open({ id: PANE, title: 'Model router' })).isPlaced
+    return next(e)
+  })
+
+  // A prompt counts as asked, so the pane is placed at any width (VS Code's narrow panel included).
+  on('prompt.submit', async ($, e, next) => {
+    if (!isPaneShown) isPaneShown = (await $.ui.open({ id: PANE, title: 'Model router' })).isPlaced
     return next(e)
   })
 
@@ -164,27 +199,34 @@ export const register: Register = on => {
       await meter($, REVIEWER, review.usage)
       const text = review.isAnswered ? review.text : `review failed: ${review.reason}`
       $.ui.toast(`Sonnet 5.5 review: ${text.split('\n')[0]?.slice(0, 120) ?? ''}`, { timeoutMs: 8000 })
+      await update($, lastReview, () => text.split('\n')[0]?.slice(0, 200) ?? '')
       return { ...r, context: [...(r.context ?? []), `Sonnet 5.5 review of this change:\n${text}`] }
     } finally {
       await update($, reviewing, n => n - 1)
     }
   })
 
-  // Terminal and desktop only (VS Code does not raise AbovePrompt): running coders and pending reviews.
-  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+  // Every surface, VS Code included: a live pane with the router's state.
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const { Box, Text } = $.ui.resolve(e)
     const list = await read($, runs)
     const n = await read($, reviewing)
-    if (e.props.hasSurvey || (list.length === 0 && n === 0)) return next(e)
-    const { Box, Text } = $.ui.resolve(e)
+    const usage = Object.entries(await read($, today))
+    const last = await read($, lastReview)
     return (
       <Box flexDirection="column">
-        {list.slice(0, Math.max(1, e.props.maxRows - 1)).map(run => (
+        <Text bold color="green">● model-router active</Text>
+        <Text>main chat  Opus 5.5 · high</Text>
+        <Text>edits      Haiku 5.5 · {list.length} coder{list.length === 1 ? '' : 's'} running</Text>
+        <Text>review     Sonnet 5.5{n > 0 ? ` · reviewing ${n}` : ''}</Text>
+        <Text dimColor>today      {usage.map(([m, v]) => `${m} ${k(v)}`).join(' · ') || 'no usage yet'}</Text>
+        {list.map(run => (
           <Text color="cyan">
             haiku ▸ {run.task}
             {run.files.length > 0 ? ` (${run.files.map(base).join(', ')})` : ''}
           </Text>
         ))}
-        {n > 0 && <Text color="yellow">sonnet ▸ reviewing {n} change{n > 1 ? 's' : ''}</Text>}
+        {last !== '' && <Text dimColor>last review: {last}</Text>}
       </Box>
     )
   })
@@ -194,6 +236,18 @@ export const register: Register = on => {
     const input = e.props.input as { subagent_type?: string; description?: string }
     if (input.subagent_type !== CODER_TYPE) return next(e)
     return next({ ...e, props: { ...e.props, input: { ...input, description: `Haiku 5.5 · ${input.description ?? ''}` } } })
+  })
+
+  on('command.run', { command: 'router' }, async $ => {
+    isPaneShown = (await $.ui.open({ id: PANE, title: 'Model router' })).isPlaced
+    return { text: await card($) }
+  })
+
+  // VS Code prints command output as plain text: draw this plugin's commands as markdown on every surface.
+  on('ui.render', { component: 'CommandOutput' }, ($, e, next) => {
+    if (!['router', 'router-usage'].includes(e.props.command) || e.props.isErrored) return next(e)
+    const { Markdown } = $.ui.resolve(e)
+    return <Markdown text={e.props.text.replace(/^model-router: /, '')} />
   })
 
   on('command.run', { command: 'router-usage' }, async $ => ({

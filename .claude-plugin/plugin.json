@@ -1,6 +1,6 @@
 {
   "name": "model-router",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Hard model router: Opus 5.5 plans and hands off, parallel Haiku 5.5 coders edit, Sonnet 5.5 reviews; meters tokens per model.",
   "author": { "name": "Andrea Scotti" },
   "types": "./types/index.d.ts"

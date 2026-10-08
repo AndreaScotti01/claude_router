@@ -24,17 +24,32 @@ test('coder prompt must be a handoff document', async ($, on) => {
   expect(r.deny).toContain('## Done when')
 })
 
-test('band shows running coders on terminal and VS Code', async ($, on) => {
+test('pane shows the router state on terminal and VS Code', async ($, on) => {
   on('agent.spawn', (_$, e) => ({ model: e.model ?? '', agentId: 'coder-1' }))
   await $.agent.spawn({ subagentType: 'model-router:coder', prompt: HANDOFF, description: 'rename x' } as never)
   for (const surface of ['terminal', 'vscode'] as const) {
     const ui = await $.ui.mount({
       plugin: 'model-router',
       surface,
-      component: 'AbovePrompt',
-      props: { hasSurvey: false, isWorking: true, maxRows: 6 } as never,
+      component: 'Pane',
+      requestId: 'model-router',
+      props: { title: 'Model router', isFocused: false, bodyColumns: 60, placement: 'dock' } as never,
     })
+    expect(await ui.find({ type: 'Text', text: /model-router active/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /haiku ▸ rename x/ })).toBeDefined()
+    await ui.unmount()
+  }
+})
+
+test('command output is drawn as markdown on terminal and VS Code', async $ => {
+  for (const surface of ['terminal', 'vscode'] as const) {
+    const ui = await $.ui.mount({
+      plugin: 'model-router',
+      surface,
+      component: 'CommandOutput',
+      props: { command: 'router-usage', args: '', text: '| a | b |\n|---|---|\n| 1 | 2 |', isErrored: false },
+    })
+    expect(await ui.find({ type: 'Markdown' })).toBeDefined()
     await ui.unmount()
   }
 })

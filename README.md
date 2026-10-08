@@ -40,29 +40,30 @@ flowchart TD
 
 ## Install
 
-### Terminal (recommended)
+`/plugin` is interactive and exists only in a terminal session: in the VS Code extension it answers `/plugin isn't available in this environment`. The `claude plugin` CLI does the same install from any shell, including VS Code's integrated terminal.
 
-1. Start Claude Code: `claude`
-2. Run:
-   ```
-   /plugin install model-router --marketplace AndreaScotti01/claude_router
-   ```
-3. Answer `y` to **Add marketplace?**
-4. Pick the **user** scope to use it in every project (or **project** for this repo only).
-5. You see `Installed model-router. Plugin is now active.` It runs in that session right away.
-
-### VS Code extension
-
-The `/plugin install` command runs in a terminal session only.
-
-1. Install once from a terminal at the **user** scope (steps above).
-2. In VS Code, close any open Claude Code tab and open a new one: sessions started after the install load the plugin.
-
-### From a local clone (development)
+### From GitHub (any shell)
 
 ```
-git clone https://github.com/AndreaScotti01/claude_router.git
-claude --plugin-dir ./claude_router
+claude plugin install model-router --marketplace AndreaScotti01/claude_router --scope user
+```
+
+This adds the `claude-router` marketplace to your user settings and installs the plugin. In a terminal Claude Code session the interactive equivalent is `/plugin install model-router --marketplace AndreaScotti01/claude_router` (answer `y` to **Add marketplace?**, then pick the **user** scope).
+
+### From a local clone (no push needed)
+
+```
+git clone https://github.com/AndreaScotti01/claude_router.git ~/PycharmProjects/claude_router
+claude plugin marketplace add ~/PycharmProjects/claude_router
+claude plugin install model-router@claude-router --scope user
+```
+
+The plugin is then read from the folder itself (`claude plugin list` shows `Read from: <folder>`): edit it and run `/reload-plugins`, no reinstall.
+
+### Load it without installing (one session)
+
+```
+claude --plugin-dir ~/PycharmProjects/claude_router
 ```
 
 Where no flag can be given (VS Code, SDK hosts), name the folder in `~/.claude/settings.json` and open a new session:
@@ -71,30 +72,34 @@ Where no flag can be given (VS Code, SDK hosts), name the folder in `~/.claude/s
 { "env": { "CLAUDE_CODE_PLUGIN_DIRS": "/absolute/path/to/claude_router" } }
 ```
 
+### Then
+
+Open a new session (in VS Code: a new Claude Code tab); sessions started before the install do not load it. Do not combine an install with `--plugin-dir` or `CLAUDE_CODE_PLUGIN_DIRS` on the same folder: the plugin would load twice (double metering, double reviews).
+
 ## Check it is active
 
 | Check | Terminal | VS Code |
 |---|---|---|
+| Run `claude plugin list` | shows `model-router@claude-router`, `Status: ✔ enabled` | same (VS Code terminal) |
 | Type `/router-usage` | table of tokens per model per day | same |
 | Ask Claude to change any file | an agent row labelled `Haiku 5.5 · <task>`; after it, Opus quotes the Sonnet review | same |
 | Toast `Sonnet 5.5 review: …` | after each coder | where the extension shows plugin toasts |
 | Status line `router · today opus 33k · haiku 12k · sonnet 11k` | under the prompt | where the extension shows plugin status lines |
-| Band listing running coders and pending reviews | above the prompt | not drawn: VS Code does not show the above-prompt band |
+| **Model router** pane: `● model-router active`, model per role, today's tokens, running coders, last review | opens at session start (wide terminals) or with your first prompt | opens with your first prompt |
+| Type `/router` | reopens the pane | same |
 
 Usage history is stored in `~/.claude/plugins/store/model-router_*.json`.
 
 ## Update
 
-```
-claude plugin update model-router
-```
-
-Then run `/reload-plugins` in open sessions (or open a new session).
+- Installed from GitHub: `claude plugin update model-router@claude-router`, then open a new session.
+- Installed from a local clone: `git pull` in the folder, then `/reload-plugins` in open sessions.
 
 ## Uninstall
 
 ```
-claude plugin uninstall model-router
+claude plugin uninstall model-router@claude-router --scope user
+claude plugin marketplace remove claude-router
 ```
 
 ## Configure
