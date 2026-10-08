@@ -53,3 +53,43 @@ test('command output is drawn as markdown on terminal and VS Code', async $ => {
     await ui.unmount()
   }
 })
+
+test('router-usage reports plan usage', async ($, on) => {
+  on('session.usage', () => ({ value: { startedAt: 0, rateLimits: [{ kind: 'five_hour', percentUsed: 20 }] } }) as never)
+  const r = await $.command.run({ command: 'router-usage', args: '' } as never)
+  expect(JSON.stringify(r)).toContain('Plan usage')
+  expect(JSON.stringify(r)).toContain('20%')
+})
+
+test('finished coders cannot be resumed', async ($, on) => {
+  on('agent.spawn', (_$, e) => ({ model: e.model ?? '', agentId: 'coder-9' }))
+  on('tool.call', () => ({ result: 'sent' }) as never)
+  await $.agent.spawn({ subagentType: 'model-router:coder', prompt: HANDOFF, description: 'x' } as never)
+  const r = await $.tool.call({ tool: 'SendMessage', to: 'coder-9', message: 'one more thing' } as never)
+  expect(JSON.stringify(r)).toContain('single-use')
+})
+
+test('only absolute paths in ## Files lock files', async ($, on) => {
+  let release = () => {}
+  const gate = new Promise<void>(resolve => (release = resolve))
+  let calls = 0
+  on('tool.call', async () => {
+    if (calls++ === 0) await gate
+    return { result: 'done' } as never
+  })
+  const handoff = (files: string, steps = files) =>
+    `## Goal\ng\n\n## Context\nc\n\n## Files\n${files}\n\n## Steps\n${steps}\n\n## Done when\nd`
+  const agent = (files: string, steps?: string) =>
+    $.tool.call({ tool: 'Agent', subagent_type: 'model-router:coder', description: 'x', prompt: handoff(files, steps) } as never)
+  const first = agent('/tmp/a.py, src/x.py, https://x.io and / here')
+  const other = await agent('/tmp/b.py')
+  const overlap = await agent('/tmp/a.py')
+  const sameSteps = await agent('/tmp/c.py', '/tmp/a.py, src/x.py, https://x.io and / here')
+  const noFiles = await agent('src/relative.py')
+  release()
+  await first
+  expect(JSON.stringify(other)).not.toContain('already belong')
+  expect(JSON.stringify(overlap)).toContain('already belong')
+  expect(JSON.stringify(sameSteps)).toContain('different instructions')
+  expect(JSON.stringify(noFiles)).toContain('absolute path')
+})

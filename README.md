@@ -5,10 +5,14 @@ A Claude Code mod (`model-router`) that hard-routes work between models, makes O
 | Role | Model | Enforced by |
 |---|---|---|
 | Main chat | Opus 5.5, high effort | every main-chat model request is rewritten to `claude-opus-5-5` / `high`; a system-prompt section teaches Opus the protocol |
-| File edits | Haiku 5.5 | `Edit`/`Write`/`NotebookEdit` are denied outside `model-router:coder` subagents, which always run on `claude-haiku-5-5` in the foreground |
+| File edits | Haiku 5.5, medium effort | `Edit`/`Write`/`NotebookEdit` are denied outside `model-router:coder` subagents, which always run on `claude-haiku-5-5` in the foreground |
 | Handoff | — | a coder prompt without the headings `## Goal`, `## Context`, `## Files`, `## Steps`, `## Done when` is refused with the template |
-| Parallel work | Haiku 5.5 | coders spawned in one message run at once; a file one running coder edits is locked for the others |
-| Review | Sonnet 5.5 | after each coder, `claude-sonnet-5-5` reviews the files that coder changed, given the user's request, Opus's notes, the handoff document and the coder's report; the review is appended to the coder's result |
+| Parallel work | Haiku 5.5 | Opus splits every change by file and spawns one coder per independent file group in one message (usually 1–3), so they run at once; 8 is a hard cap, not a target |
+| File locks | — | each coder must list its files (absolute paths under `## Files`) and get its own `## Steps`: the files are locked to that coder, overlapping files or repeated Steps are refused, and a coder cannot edit outside its list |
+| Review | Sonnet 5.5, high effort | when the last coder of a batch finishes, one `model-router:reviewer` agent on `claude-sonnet-5-5` reviews and tests the whole batch (user request, Opus notes, each handoff, report and diff; it can run tests but never edits); its report is appended to the last coder's result |
+| Single-use agents | Haiku 5.5, Sonnet 5.5 | coders and the batch reviewer are fresh sessions, pruned when done: SendMessage to them is refused and they are never compacted; Opus is the only stateful session and the only one auto-compacted |
+
+Effort is set per model on every request: Opus high, Sonnet high, Haiku medium. Your session's effort setting applies to Opus only.
 
 ## How it works
 
@@ -21,15 +25,15 @@ flowchart TD
     H -->|"missing headings: template sent back"| O
     H --> C1["Haiku 5.5 coder 1"]
     H --> C2["Haiku 5.5 coder 2"]
-    H --> CN["Haiku 5.5 coder n"]
+    H --> CN["Haiku 5.5 coder n (up to 8)"]
     C1 & C2 & CN -->|"edit own files, one coder per file"| F[("working tree")]
-    C1 & C2 & CN -->|report| R["Sonnet 5.5 review"]
-    F -->|"diff of that coder's files"| R
+    C1 & C2 & CN -->|reports| R["Sonnet 5.5 reviewer agent<br/>one per batch, then pruned"]
+    F -->|"diffs of the batch's files"| R
     O -.->|"user request, Opus notes, handoff"| R
-    R -->|"review appended to the coder result"| O
+    R -->|"batch review appended to the last coder result"| O
     O -->|answer| U
-    O & C1 & C2 & CN & R -.->|tokens| M[("meter: per model, per day")]
-    M -.-> S["status line · /router-usage"]
+    O & C1 & C2 & CN & R -.->|tokens| M[("meter: per hour, per part")]
+    M -.-> S["/router-usage: plan % and breakdown · /router card · status line"]
 ```
 
 ## Requirements
@@ -81,14 +85,14 @@ Open a new session (in VS Code: a new Claude Code tab); sessions started before 
 | Check | Terminal | VS Code |
 |---|---|---|
 | Run `claude plugin list` | shows `model-router@claude-router`, `Status: ✔ enabled` | same (VS Code terminal) |
-| Type `/router-usage` | table of tokens per model per day | same |
+| Type `/router-usage` | plan usage % (5h session, 7-day week) and where the tokens went (Opus chat, handoff docs, Haiku coders, Sonnet reviews, other subagents) as % of today, the session and the week | same |
 | Ask Claude to change any file | an agent row labelled `Haiku 5.5 · <task>`; after it, Opus quotes the Sonnet review | same |
-| Toast `Sonnet 5.5 review: …` | after each coder | where the extension shows plugin toasts |
+| Toast `Sonnet 5.5 review: …` | after each batch (when its last coder finishes) | where the extension shows plugin toasts |
 | Status line `router · today opus 33k · haiku 12k · sonnet 11k` | under the prompt | where the extension shows plugin status lines |
 | **Model router** pane: `● model-router active`, model per role, today's tokens, running coders, last review | opens at session start (wide terminals) or with your first prompt | opens with your first prompt |
-| Type `/router` | reopens the pane | same |
+| Type `/router` | status card (models per role, plan %, today's tokens, running coders, last review) and reopens the pane | status card |
 
-Usage history is stored in `~/.claude/plugins/store/model-router_*.json`.
+Usage is stored per hour and per part in `~/.claude/plugins/store/model-router_*.json` and kept for 35 days. Handoff tokens are estimated from document length (4 characters ≈ 1 token); "≈ plan" splits the plan % by token share, which is approximate because the plan weighs models differently.
 
 ## Update
 
@@ -109,6 +113,8 @@ The models are constants at the top of `hooks/register.tsx`: `MAIN`, `CODER`, `R
 ## Known limits
 
 - The main chat can still change files through Bash (`sed -i`, heredocs).
+- Finished agents stay listed in VS Code's Agent map until Claude Code drops them; the plugin API cannot remove them (they can no longer be resumed).
+- A subagent that fills its context is not compacted: it ends, and Opus re-delegates a smaller task.
 - Coder bookkeeping lives in memory: a hot reload while a coder runs denies that coder's edits; re-delegate.
 - The plugin API is early access; a Claude Code update can break it.
 
