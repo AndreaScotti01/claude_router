@@ -85,7 +85,7 @@ Open a new session (in VS Code: a new Claude Code tab); sessions started before 
 | Check | Terminal | VS Code |
 |---|---|---|
 | Run `claude plugin list` | shows `model-router@claude-router`, `Status: ✔ enabled` | same (VS Code terminal) |
-| Type `/router-usage` | three tables: the account plan limits (5h session and 7-day week, all your devices); **This chat**: the router's usage in the chat you typed it in; **All chats on this computer**: cumulative usage of every chat, open or closed. Each lists the parts (Opus chat, handoff docs, Haiku coders, Sonnet reviews, other subagents) with their % share and the plan points they cost in the session and the week | same |
+| Type `/router-usage` | three tables: the account plan limits (5h session and 7-day week, all your devices); **This chat**: the router's usage in the chat you typed it in; **All chats on this computer**: cumulative usage of every chat, open or closed. Each lists the parts (Opus chat, handoff docs, Haiku coders, Sonnet reviews, other subagents) with their % share, the plan points they cost in the session and the week, and their tokens over the last 7 days (in, out, cache read, cache write) | same |
 | Type `/router-usage reset` | clears the router counters for all chats on this computer (one backup kept); the plan % and the learned rate are unaffected | same |
 | Ask Claude to change any file | agent rows labelled `Haiku 5.5 · <task>`, then one Sonnet reviewer row (and fix-coder rows if a test failed); Opus relays the review | same |
 | Status line `router · today opus 33k · haiku 12k · sonnet 11k` | under the prompt | where the extension shows plugin status lines |

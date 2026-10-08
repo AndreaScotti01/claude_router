@@ -268,6 +268,11 @@ async function report($: EngineInterface) {
       return c
     })
     const sums = by.map(c => PARTS.reduce((t, [part]) => (part === 'handoff' ? t : t + c[part]), 0))
+    const tok = Object.fromEntries(PARTS.map(([p]) => [p, empty()])) as Record<Part, Row>
+    for (const [id, row] of Object.entries(windows[1] ?? {})) if (keep(id)) addTo(tok[partOf(id)], row)
+    const sumTok = empty()
+    for (const [part] of PARTS) if (part !== 'handoff') addTo(sumTok, tok[part]) // handoff docs are part of Opus chat output
+    const toks = (t: Row) => `${k(t.input)} | ${k(t.output)} | ${k(t.cacheRead)} | ${k(t.cacheWrite)}`
     const week = sums[1] ?? 0
     if (week === 0) return ['', title, '', 'No router usage yet.']
     const pts = (c: number, i: number) => {
@@ -276,21 +281,27 @@ async function report($: EngineInterface) {
     }
     const models = (part: Part) =>
       [...new Set(Object.keys(windows[1] ?? {}).filter(id => keep(id) && partOf(id) === part).map(id => short(modelOf(id))))].join(', ') || '—'
-    const out = ['', title, '', '| part | model | share | ≈ of session (5h) | ≈ of week (7d) |', '|---|---|--:|--:|--:|']
+    const out = [
+      '',
+      title,
+      '',
+      '| part | model | share | ≈ of session (5h) | ≈ of week (7d) | in | out | cache read | cache write |',
+      '|---|---|--:|--:|--:|--:|--:|--:|--:|',
+    ]
     for (const [part, label] of PARTS) {
       const c = by[1]?.[part] ?? 0
       if (c === 0) continue
       const share = (c / week) * 100
-      out.push(`| ${label} | ${models(part)} | ${share < 1 ? '<1' : Math.round(share)}% | ${pts(by[0]?.[part] ?? 0, 0)} | ${pts(c, 1)} |`)
+      out.push(`| ${label} | ${models(part)} | ${share < 1 ? '<1' : Math.round(share)}% | ${pts(by[0]?.[part] ?? 0, 0)} | ${pts(c, 1)} | ${toks(tok[part])} |`)
     }
-    out.push(`| **total** | | **100%** | **${pts(sums[0] ?? 0, 0)}** | **${pts(week, 1)}** |`)
+    out.push(`| **total** | | **100%** | **${pts(sums[0] ?? 0, 0)}** | **${pts(week, 1)}** | ${toks(sumTok)} |`)
     return out
   }
   lines.push(
     ...table('**This chat**', id => id.endsWith(`|${sid}`)),
     ...table(`**All chats on this computer** (since ${when(from)})`, () => true),
     '',
-    '_Router usage only: chats on this computer with the router loaded; other devices count in the plan table but not here. Share weighs each part by API list price over the last 7 days. "≈ of session / week" = the plan points that usage cost, learned from moments the plan moved 5+ points while this computer worked ("calibrating" until then). Usage recorded before chats were tagged counts only under all chats. `/router-usage reset` clears the counters._',
+    '_Router usage only: chats on this computer with the router loaded; other devices count in the plan table but not here. Share weighs each part by API list price over the last 7 days; the token columns cover the same 7 days (in = new input, out = output, cache read / cache write = context re-read from or written to the prompt cache). "≈ of session / week" = the plan points that usage cost, learned from moments the plan moved 5+ points while this computer worked ("calibrating" until then). Usage recorded before chats were tagged counts only under all chats. `/router-usage reset` clears the counters._',
   )
   return lines.join('\n')
 }
