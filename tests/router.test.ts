@@ -55,9 +55,11 @@ test('command output is drawn as markdown on terminal and VS Code', async $ => {
 })
 
 test('router-usage reports plan usage', async ($, on) => {
+  on('store.get', () => ({ value: undefined }) as never)
+  on('store.set', () => ({ value: undefined }) as never)
   on('session.usage', () => ({ value: { startedAt: 0, rateLimits: [{ kind: 'five_hour', percentUsed: 20 }] } }) as never)
   const r = await $.command.run({ command: 'router-usage', args: '' } as never)
-  expect(JSON.stringify(r)).toContain('Plan usage')
+  expect(JSON.stringify(r)).toContain('Account plan')
   expect(JSON.stringify(r)).toContain('20%')
 })
 
@@ -92,4 +94,11 @@ test('only absolute paths in ## Files lock files', async ($, on) => {
   expect(JSON.stringify(overlap)).toContain('already belong')
   expect(JSON.stringify(sameSteps)).toContain('different instructions')
   expect(JSON.stringify(noFiles)).toContain('absolute path')
+})
+
+test('router-usage reset clears the counters', async ($, on) => {
+  on('store.get', () => ({ value: undefined }) as never)
+  on('store.set', () => ({ value: undefined }) as never)
+  const r = await $.command.run({ command: 'router-usage', args: 'reset' } as never)
+  expect(JSON.stringify(r)).toContain('are reset')
 })

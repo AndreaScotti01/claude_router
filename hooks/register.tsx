@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, ModelUsage, Register, SessionMessage } from 'claude-code'
+import type { EngineInterface, ModelUsage, Register, SessionMessage, SessionRateLimit } from 'claude-code'
 
 const MAIN = 'claude-opus-5-5'
 const CODER = 'claude-haiku-5-5'
@@ -123,11 +123,47 @@ const totals = () => {
 const usageLine = () =>
   `router · today ${Object.entries(totals()).map(([m, v]) => `${m} ${k(v)}`).join(' · ') || 'no usage yet'}`
 
-async function meter($: EngineInterface, part: Part, model: string, row: Row) {
-  addTo(((ledger[hour()] ??= {})[`${part}:${model}`] ??= empty()), row)
+type Plan = { at: number; rateLimits: SessionRateLimit[] }
+let writes: Promise<unknown> = Promise.resolve()
+
+// The plan % is account-wide (every device and session); the last reading is kept so a fresh session can show it.
+async function planReading($: EngineInterface): Promise<Plan | undefined> {
+  const { rateLimits } = await $.session.usage()
+  if (rateLimits.length === 0) return (await $.store.get('plan')) as Plan | undefined
+  const plan = { at: Date.now(), rateLimits: [...rateLimits] }
+  await $.store.set('plan', plan)
+  return plan
+}
+const when = (t: number) => {
+  const d = new Date(t)
+  return `${d.toDateString() === new Date().toDateString() ? 'today' : d.toDateString()} ${d.toTimeString().slice(0, 5)}`
+}
+
+// Every session on this computer shares the ledger: re-read it before each write, one write at a time.
+function meter($: EngineInterface, part: Part, model: string, row: Row) {
+  writes = writes
+    .then(async () => {
+      ledger = ((await $.store.get('usage')) ?? {}) as Ledger
+      addTo(((ledger[hour()] ??= {})[`${part}:${model}`] ??= empty()), row)
+      await $.store.set('usage', ledger)
+      await planReading($)
+    })
+    .catch(() => undefined)
+  return writes.then(async () => {
+    $.ui.status(usageLine())
+    await update($, today, () => totals())
+  })
+}
+
+async function reset($: EngineInterface) {
+  await writes
+  await $.store.set('usageBeforeReset', (await $.store.get('usage')) ?? {}) // ponytail: one backup in the store file, no restore command
+  ledger = {}
+  await $.store.set('usage', ledger)
+  await $.store.set('since', Date.now())
   $.ui.status(usageLine())
   await update($, today, () => totals())
-  await $.store.set('usage', ledger)
+  return "**model-router counters on this computer are reset.** The previous counters are kept once as `usageBeforeReset` in `~/.claude/plugins/store/model-router_*.json`. The account plan % is Anthropic's and is not affected."
 }
 
 async function changeOf($: EngineInterface, paths: string[]) {
@@ -144,65 +180,59 @@ async function changeOf($: EngineInterface, paths: string[]) {
 }
 
 async function report($: EngineInterface) {
-  const { rateLimits } = await $.session.usage()
+  const plan = await planReading($)
   const now = Date.now()
   const win = (kind: string, ms: number) => {
-    const r = rateLimits.find(l => l.kind === kind)
-    const end = r?.resetsAt ? Date.parse(r.resetsAt) : now
-    return { pct: r?.percentUsed, start: end - ms, left: r?.resetsAt ? dur(end - now) : '—' }
+    const r = plan?.rateLimits.find(l => l.kind === kind)
+    const end = r?.resetsAt ? Date.parse(r.resetsAt) : 0
+    if (!r) return { used: 'no reading yet', left: '—', start: now - ms }
+    if (end && end <= now) return { used: 'reset since the last reading', left: '—', start: now - ms }
+    return { used: `${r.percentUsed}%`, left: end ? dur(end - now) : '—', start: end ? end - ms : now - ms }
   }
   const session = win('five_hour', 5 * HOUR)
   const week = win('seven_day', 7 * 24 * HOUR)
-  const pct = (p?: number) => (p === undefined ? 'no reading yet' : `${p}%`)
+  const from = ((await $.store.get('since')) as number | undefined) ?? Math.min(now, ...Object.keys(ledger).map(bucketStart))
   const lines = [
-    '**Plan usage** (as of the last API response)',
+    `**Account plan: all your devices and sessions**${plan ? ` (Anthropic's reading from ${when(plan.at)})` : ''}`,
     '',
     '| window | used | resets in |',
     '|---|--:|--:|',
-    `| session (5h) | ${pct(session.pct)} | ${session.left} |`,
-    `| week (7d) | ${pct(week.pct)} | ${week.left} |`,
+    `| session (5h) | ${session.used} | ${session.left} |`,
+    `| week (7d) | ${week.used} | ${week.left} |`,
+    '',
+    `**model-router on this computer** (counting since ${when(from)}): only sessions on this computer with the router loaded. Other devices, and sessions without the router, count in the plan above but not here.`,
   ]
-  const cols = [
-    { rows: since(midnight()), pct: undefined as number | undefined },
-    { rows: since(session.start), pct: session.pct },
-    { rows: since(week.start), pct: week.pct },
-  ]
-  const byPart = cols.map(c => {
+  const cols = [since(midnight()), since(session.start), since(week.start)]
+  const byPart = cols.map(rows => {
     const out = Object.fromEntries(PARTS.map(([p]) => [p, empty()])) as Record<Part, Row>
-    for (const [id, r] of Object.entries(c.rows)) addTo(out[partOf(id)], r)
+    for (const [id, r] of Object.entries(rows)) addTo(out[partOf(id)], r)
     return out
   })
-  const sums = byPart.map(p => PARTS.reduce((t, [part]) => (part === 'handoff' ? t : t + tokens(p[part])), 0))
-  if (sums.every(s => s === 0)) return [...lines, '', 'No usage recorded yet.'].join('\n')
+  const outs = byPart.map(p => PARTS.reduce((t, [part]) => (part === 'handoff' ? t : t + p[part].output), 0))
+  if (outs.every(o => o === 0)) return [...lines, '', 'No usage recorded yet.'].join('\n')
   const models = (part: Part) =>
-    [...new Set(Object.keys(cols[2]?.rows ?? {}).filter(id => partOf(id) === part).map(id => short(modelOf(id))))].join(', ') || '—'
-  lines.push(
-    '',
-    '**Where the tokens went** (share of the tokens the router metered)',
-    '',
-    '| part | model | today | session (5h) | week (7d) |',
-    '|---|---|--:|--:|--:|',
-  )
+    [...new Set(Object.keys(cols[2] ?? {}).filter(id => partOf(id) === part).map(id => short(modelOf(id))))].join(', ') || '—'
+  lines.push('', '| part | model | today | session (5h) | week (7d) |', '|---|---|--:|--:|--:|')
   for (const [part, label] of PARTS) {
-    const cells = cols.map((c, i) => {
-      const t = tokens(byPart[i]?.[part] ?? empty())
-      const sum = sums[i] ?? 0
-      if (t === 0 || sum === 0) return '—'
-      const share = (t / sum) * 100
-      const plan = c.pct === undefined ? '' : ` · ≈${((share * c.pct) / 100).toFixed(1)}% plan`
-      return `${share.toFixed(share < 1 ? 1 : 0)}% · ${k(t)}${plan}`
+    const cells = byPart.map((p, i) => {
+      const out = p[part].output
+      const sum = outs[i] ?? 0
+      if (out === 0 || sum === 0) return '—'
+      const share = (out / sum) * 100
+      return `${share < 1 ? '<1' : Math.round(share)}% · ${k(out)} out`
     })
     lines.push(`| ${label} | ${models(part)} | ${cells.join(' | ')} |`)
   }
-  lines.push(`| **total** | | ${sums.map(s => `**${k(s)}**`).join(' | ')} |`)
-  lines.push('', '**This week in detail**', '', '| part | calls | input | output | cache read | cache write |', '|---|--:|--:|--:|--:|--:|')
+  lines.push(`| **total** | | ${outs.map(o => `**${k(o)} out**`).join(' | ')} |`)
+  lines.push('', '**Last 7 days in detail**', '', '| part | calls | output | new input | cache write | cache read |', '|---|--:|--:|--:|--:|--:|')
   for (const [part, label] of PARTS) {
     const r = byPart[2]?.[part] ?? empty()
-    if (r.calls > 0) lines.push(`| ${label} | ${Math.round(r.calls)} | ${k(r.input)} | ${k(r.output)} | ${k(r.cacheRead)} | ${k(r.cacheWrite)} |`)
+    if (r.calls > 0)
+      lines.push(`| ${label} | ${Math.round(r.calls)} | ${k(r.output)} | ${k(r.input)} | ${k(r.cacheWrite)} | ${k(r.cacheRead)} |`)
   }
   lines.push(
     '',
-    '_Shares count input, output and cache tokens. "≈ plan" is the window\'s plan % times the share; the plan weighs models differently, so it is a rough split. Handoff docs are estimated from their length (4 characters ≈ 1 token); they are part of Opus chat output and are not added to the total._',
+    '_% = share of output tokens (what each model generated). Cache reads re-read earlier context: cheap, so they are listed apart and not used for shares. The plan % is not split by part because it includes usage the router never sees. Handoff docs are estimated (4 characters ≈ 1 token) and are part of Opus chat output. `/router-usage reset` clears these counters._',
   )
   return lines.join('\n')
 }
@@ -212,9 +242,9 @@ async function card($: EngineInterface) {
   const n = await read($, reviewing)
   const last = await read($, lastReview)
   const usage = Object.entries(await read($, today)).map(([m, v]) => `${m} ${k(v)}`).join(' · ') || 'no usage yet'
-  const { rateLimits } = await $.session.usage()
+  const reading = await planReading($)
   const plan =
-    rateLimits
+    reading?.rateLimits
       .map(l => `${l.kind === 'five_hour' ? 'session' : l.kind === 'seven_day' ? 'week' : l.kind} ${l.percentUsed}%`)
       .join(' · ') || 'no reading yet'
   return [
@@ -226,7 +256,7 @@ async function card($: EngineInterface) {
     `| edits | Haiku 5.5 · ${list.length} coder${list.length === 1 ? '' : 's'} running |`,
     `| review | Sonnet 5.5${n > 0 ? ` · reviewing ${n}` : ''} |`,
     '',
-    `**Plan:** ${plan}`,
+    `**Plan (all devices):** ${plan}`,
     '',
     `**Today:** ${usage}`,
     ...list.map(run => `- haiku ▸ ${run.task}${run.files.length > 0 ? ` (${run.files.map(base).join(', ')})` : ''}`),
@@ -259,7 +289,11 @@ export const register: Register = on => {
       effort: 'high',
       disallowedTools: ['Agent', 'Edit', 'Write', 'NotebookEdit'],
     })
-    await $.command.register({ name: 'router-usage', description: 'Plan usage % and where the tokens went (model-router)' })
+    await $.command.register({
+      name: 'router-usage',
+      description: "Account plan % and where this computer's router tokens went; 'reset' clears the counters (model-router)",
+      argumentHint: 'reset',
+    })
     await $.command.register({ name: 'router', description: 'Show model-router status and open its pane' })
     isPaneShown = (await $.ui.open({ id: PANE, title: 'Model router' })).isPlaced
     return next(e)
@@ -454,5 +488,7 @@ export const register: Register = on => {
     return <Markdown text={e.props.text.replace(/^model-router: /, '')} />
   })
 
-  on('command.run', { command: 'router-usage' }, async $ => ({ text: await report($) }))
+  on('command.run', { command: 'router-usage' }, async ($, e) => ({
+    text: e.args.trim() === 'reset' ? await reset($) : await report($),
+  }))
 }

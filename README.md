@@ -33,7 +33,7 @@ flowchart TD
     R -->|"batch review appended to the last coder result"| O
     O -->|answer| U
     O & C1 & C2 & CN & R -.->|tokens| M[("meter: per hour, per part")]
-    M -.-> S["/router-usage: plan % and breakdown · /router card · status line"]
+    M -.-> S["/router-usage: plan % (account) and this computer's breakdown · reset · /router card"]
 ```
 
 ## Requirements
@@ -85,14 +85,15 @@ Open a new session (in VS Code: a new Claude Code tab); sessions started before 
 | Check | Terminal | VS Code |
 |---|---|---|
 | Run `claude plugin list` | shows `model-router@claude-router`, `Status: ✔ enabled` | same (VS Code terminal) |
-| Type `/router-usage` | plan usage % (5h session, 7-day week) and where the tokens went (Opus chat, handoff docs, Haiku coders, Sonnet reviews, other subagents) as % of today, the session and the week | same |
+| Type `/router-usage` | account plan % (5h session, 7-day week; all your devices) and, separately, this computer's router tokens per part (Opus chat, handoff docs, Haiku coders, Sonnet reviews, other subagents) as % of output for today, the session and the week | same |
+| Type `/router-usage reset` | clears this computer's router counters (one backup kept); the plan % is unaffected | same |
 | Ask Claude to change any file | an agent row labelled `Haiku 5.5 · <task>`; after it, Opus quotes the Sonnet review | same |
 | Toast `Sonnet 5.5 review: …` | after each batch (when its last coder finishes) | where the extension shows plugin toasts |
 | Status line `router · today opus 33k · haiku 12k · sonnet 11k` | under the prompt | where the extension shows plugin status lines |
 | **Model router** pane: `● model-router active`, model per role, today's tokens, running coders, last review | opens at session start (wide terminals) or with your first prompt | opens with your first prompt |
 | Type `/router` | status card (models per role, plan %, today's tokens, running coders, last review) and reopens the pane | status card |
 
-Usage is stored per hour and per part in `~/.claude/plugins/store/model-router_*.json` and kept for 35 days. Handoff tokens are estimated from document length (4 characters ≈ 1 token); "≈ plan" splits the plan % by token share, which is approximate because the plan weighs models differently.
+Router usage is stored per hour and per part in `~/.claude/plugins/store/model-router_*.json`, shared by every session on this computer, and kept for 35 days. It counts only sessions on this computer with the router loaded; the plan % is Anthropic's account-wide reading (all devices, claude.ai, sessions without the router), so the two are shown apart and the plan % is not split by part. Shares use output tokens; cache reads are listed separately. Handoff tokens are estimated from document length (4 characters ≈ 1 token).
 
 ## Update
 
