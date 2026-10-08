@@ -4,7 +4,7 @@ import type { EngineInterface, ModelUsage, Register, SessionMessage, SessionRate
 const MAIN = 'claude-opus-5-5'
 const CODER = 'claude-haiku-5-5'
 const REVIEWER = 'claude-sonnet-5-5'
-const CODER_TYPE = 'model-router:coder'
+const CODER_TYPE = 'model-router:executor'
 const REVIEWER_TYPE = 'model-router:reviewer'
 const MAX_CODERS = 8
 const MAX_FIXES = 5 // fix coders one reviewer may spawn before it must report what still fails
@@ -14,17 +14,17 @@ const MAX_CHARS = 100_000
 
 const PROTOCOL = [
   'Model router (enforced by the model-router plugin):',
-  `- You plan, explain and talk to the user. You cannot edit files: every change goes to ${CODER_TYPE} subagents (Haiku 5.5).`,
-  `- Each coder prompt must be a handoff document with these headings, in order: ${HANDOFF.join(', ')}. Coders start with no context: put in it everything they need (absolute paths, snippets, conventions, the user's intent).`,
-  `- Split every change by file: spawn one coder per independent file group, all in ONE message so they run in parallel. Usually that is 1 to 3 coders; ${MAX_CODERS} is a hard cap, not a target, so never split work just to use more coders. Each coder must get its own files (absolute paths under ## Files, locked to that coder) and its own ## Steps; overlapping files, repeated Steps or more than ${MAX_CODERS} running coders are refused, and a coder cannot edit outside its list.`,
-  `- When all coders of a batch have returned, spawn exactly one ${REVIEWER_TYPE} (Sonnet 5.5) with a brief: the user's request, what you intended, what each coder reported, and what to test. The router attaches every handoff and diff. Sonnet tests, sends failures to fresh Haiku coders until they pass (up to ${MAX_FIXES}), and reports back to you; relay its outcome to the user. New coders are refused until the batch is reviewed.`,
-  '- Coders and reviewers are single-use and pruned when done: you are the only stateful session. Never SendMessage a finished agent; spawn a fresh one with a new handoff document.',
+  `- You plan, explain and talk to the user. Hand operations to ${CODER_TYPE} subagents (Haiku 5.5): searching and reading files, mapping a folder, editing, moving or creating files, running commands, fetching or scraping web pages, and any other well-defined day-to-day task. You cannot edit files yourself; keep for yourself only quick looks that cost less than a handoff.`,
+  `- Each executor prompt must be a handoff document with these headings, in order: ${HANDOFF.join(', ')}. Executors start with no context: put in it everything they need (absolute paths, URLs, snippets, conventions, the user's intent, what to report back). Under ## Files list the absolute path of every file it may change, or write "none" for read-only work (it then cannot edit).`,
+  `- Split work into independent pieces and spawn one executor per piece, all in ONE message so they run in parallel. Usually that is 1 to 3; ${MAX_CODERS} is a hard cap, not a target. Executors that change files each get their own files (locked to that executor), and every executor gets its own ## Steps; overlapping files, repeated Steps or more than ${MAX_CODERS} running executors are refused.`,
+  `- When all executors of a batch have returned and any of them changed files, spawn exactly one ${REVIEWER_TYPE} (Sonnet 5.5) with a brief: the user's request, what you intended, what each executor reported, and what to test. The router attaches every handoff and diff. Sonnet tests, sends failures to fresh Haiku executors until they pass (up to ${MAX_FIXES}), and reports back to you; relay its outcome to the user. New executors are refused until the batch is reviewed; read-only batches need no review.`,
+  '- Executors and reviewers are single-use and pruned when done: you are the only stateful session. Never SendMessage a finished agent; spawn a fresh one with a new handoff document.',
 ].join('\n')
 
 const REVIEW_LOOP = [
   'Your job, in order:',
   '1. Check every change above against its handoff and the brief. Run the relevant tests, or a one-off check when there are none.',
-  `2. If something fails or is wrong, do not edit: spawn fresh ${CODER_TYPE} agents with handoff documents (${HANDOFF.join(', ')}; absolute paths under ## Files), one per independent file group, all in one message, then re-test. Repeat until everything passes, at most ${MAX_FIXES} fix coders in all.`,
+  `2. If something fails or is wrong, do not edit: spawn fresh ${CODER_TYPE} agents with handoff documents (${HANDOFF.join(', ')}; absolute paths under ## Files), one per independent file group, all in one message, then re-test. Repeat until everything passes, at most ${MAX_FIXES} fix executors in all.`,
   '3. Report to Opus: what you checked and ran, what you fixed, and anything still failing with file:line. Say "All checks pass." when nothing is left.',
 ].join('\n')
 
@@ -37,7 +37,7 @@ type Part = 'chat' | 'handoff' | 'coder' | 'review' | 'subagent'
 const PARTS: [Part, string][] = [
   ['chat', 'Opus chat'],
   ['handoff', '↳ handoff docs (est.)'],
-  ['coder', 'Haiku coders'],
+  ['coder', 'Haiku executors'],
   ['review', 'Sonnet reviews'],
   ['subagent', 'other subagents'],
 ]
@@ -105,10 +105,10 @@ const lastText = (msgs: SessionMessage[], role: SessionMessage['role']) =>
   [...msgs].reverse().find(m => m.role === role && m.text.trim())?.text.slice(-10_000) ?? ''
 // Absolute paths listed in a handoff's ## Files section; a path ending in / covers everything under it.
 const filesOf = (handoff: string) =>
-  new Set(handoff.split('## Files')[1]?.split('\n## ')[0]?.match(/(?<![\w.~:/-])\/[\w.@~+-][^\s`'",)]*/g) ?? [])
+  new Set(handoff.split(/^## Files[^\n]*\n/m)[1]?.split('\n## ')[0]?.match(/(?<![\w.~:/-])\/[\w.@~+-][^\s`'",)]*/g) ?? [])
 const covers = (set: Set<string>, path: string) =>
   [...set].some(d => path === d || path.startsWith(d.endsWith('/') ? d : `${d}/`))
-const stepsIn = (handoff: string) => handoff.split('## Steps')[1]?.split('\n## ')[0]?.trim() ?? ''
+const stepsIn = (handoff: string) => handoff.split(/^## Steps[^\n]*\n/m)[1]?.split('\n## ')[0]?.trim() ?? ''
 
 // Sums every bucket that overlaps [start, now), per 'part:model'; a bucket cut by `start` counts pro rata.
 function since(start: number) {
@@ -322,7 +322,7 @@ async function card($: EngineInterface) {
     '| role | model |',
     '|---|---|',
     '| main chat | Opus 5.5 · high |',
-    `| edits | Haiku 5.5 · ${list.length} coder${list.length === 1 ? '' : 's'} running |`,
+    `| executors | Haiku 5.5 · ${list.length} running |`,
     `| review | Sonnet 5.5${n > 0 ? ` · reviewing ${n}` : ''} |`,
     '',
     `**Plan (all devices):** ${plan}`,
@@ -347,10 +347,10 @@ export const register: Register = on => {
     $.ui.status(usageLine())
     await update($, today, () => totals())
     await $.agent.register({
-      name: 'coder',
-      description: `Haiku 5.5 coder: makes ALL file edits (the main chat cannot edit). The prompt must be a handoff document (${HANDOFF.join(', ')}). Spawn several in one message to work in parallel on disjoint files.`,
+      name: 'executor',
+      description: `Haiku 5.5 executor: carries out any well-defined operation Opus hands off (search and read files, map folders, edit, move or create files, run commands, fetch or scrape web pages) and reports back. The prompt must be a handoff document (${HANDOFF.join(', ')}); its Files section lists the absolute paths it may change, or "none" for read-only work. Spawn several in one message to run in parallel.`,
       prompt:
-        'You are a coder. You get a handoff document (Goal, Context, Files, Steps, Done when). Do exactly the Steps and edit only the files listed under Files: other coders may be editing other files in parallel. Smallest diff that works, match the surrounding style. Finish with the files you changed and anything you could not do.',
+        'You are an executor. You get a handoff document (Goal, Context, Files, Steps, Done when) and carry out the Steps, using your own judgment for small details the Steps leave open. Change only the files listed under Files (if it says none, change nothing): other executors may be working in parallel. For edits, make the smallest diff that works and match the surrounding style. Finish with a short report: what you did, what you found (the facts asked for, with paths or URLs), the files you changed, and anything you could not do.',
       model: CODER,
       effort: 'high',
       disallowedTools: ['Agent'],
@@ -358,9 +358,9 @@ export const register: Register = on => {
     await $.agent.register({
       name: 'reviewer',
       description:
-        'Sonnet 5.5 batch reviewer: spawn exactly one after all coders of a batch have returned, with a brief (request, intent, coder reports, what to test). It tests, sends failures to fresh Haiku coders until they pass, and reports back.',
+        'Sonnet 5.5 batch reviewer: spawn exactly one after all executors of a batch have returned, with a brief (request, intent, executor reports, what to test). It tests, sends failures to fresh Haiku executors until they pass, and reports back.',
       prompt:
-        'You review and test one batch of changes that Haiku coders made from handoff documents Opus wrote. You never edit files: every fix goes to a fresh model-router:coder with a handoff document. Follow the steps at the end of your prompt.',
+        'You review and test one batch of changes that Haiku executors made from handoff documents Opus wrote. You never edit files: every fix goes to a fresh model-router:executor with a handoff document. Follow the steps at the end of your prompt.',
       model: REVIEWER,
       effort: 'high',
       disallowedTools: ['Edit', 'Write', 'NotebookEdit'],
@@ -423,7 +423,7 @@ export const register: Register = on => {
       await update($, runs, list => [...list.filter(run => files.has(run.id)), { id, task: e.description, files: [] }])
     }
     return r
-  }).catch(($, e, next) => (next.called ? next(e) : { deny: 'model-router: coder routing failed.' }))
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: 'model-router: executor routing failed.' }))
 
   // Only running coders edit, and each file belongs to one coder at a time.
   on('tool.call', async ($, e, next) => {
@@ -434,12 +434,12 @@ export const register: Register = on => {
     const path = args.file_path ?? args.notebook_path ?? ''
     const tool = [...agentOf].find(([, a]) => a === e.agentId)?.[0] ?? ''
     const own = declared.get(tool)
-    if (own && own.size > 0 && !covers(own, path))
-      return { deny: `model-router: ${path} is not under your ## Files. Edit only your files; report anything else as not done.` }
+    if (!own || !covers(own, path))
+      return { deny: `model-router: ${path} is not in your handoff's Files (read-only executors list none). Change only your files; report anything else as not done.` }
     const owner =
       [...files].some(([id, set]) => id !== e.agentId && set.has(path)) ||
       [...declared].some(([t, set]) => t !== tool && covers(set, path))
-    if (owner) return { deny: `model-router: ${path} belongs to a parallel coder. Leave it and report it as not done.` }
+    if (owner) return { deny: `model-router: ${path} belongs to a parallel executor. Leave it and report it as not done.` }
     if (!mine.has(path)) {
       mine.add(path)
       await update($, runs, list => list.map(run => (run.id === e.agentId ? { ...run, files: [...run.files, path] } : run)))
@@ -450,11 +450,11 @@ export const register: Register = on => {
   // Coders are single-use: a finished coder is never resumed, so every Haiku session starts fresh.
   on('tool.call', { tool: 'SendMessage' }, ($, e, next) =>
     spent.has(String(e.to).split(' [')[0] ?? '')
-      ? { deny: `model-router: coders are single-use. Spawn a fresh ${CODER_TYPE} with a new handoff document.` }
+      ? { deny: `model-router: executors are single-use. Spawn a fresh ${CODER_TYPE} with a new handoff document.` }
       : next(e),
   )
 
-  // Opus hands off to Haiku coders. Once they have all returned, Opus briefs one Sonnet reviewer, which gets every handoff
+  // Opus hands off to Haiku executors. Once they have all returned, Opus briefs one Sonnet reviewer, which gets every handoff
   // and diff, tests, and sends failures to fresh Haiku coders until they pass. (A plugin cannot start agents through
   // $.tool.call, so the review is a spawn Opus makes, not one the router makes.)
   on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
@@ -464,17 +464,17 @@ export const register: Register = on => {
       return { deny: `model-router: the reviewer can only spawn ${CODER_TYPE} agents to fix what fails.` }
     if (e.subagent_type === REVIEWER_TYPE) {
       if (caller) return { deny: 'model-router: only the main chat starts the reviewer.' }
-      if (declared.size > 0) return { deny: 'model-router: coders are still running. Start the reviewer once they have all returned.' }
-      if (batch.length === 0) return { deny: 'model-router: nothing to review: no coder changed a file since the last review.' }
+      if (declared.size > 0) return { deny: 'model-router: executors are still running. Start the reviewer once they have all returned.' }
+      if (batch.length === 0) return { deny: 'model-router: nothing to review: no executor changed a file since the last review.' }
       const done = batch
       batch = []
       const share = Math.floor(MAX_CHARS / done.length)
       const changes = await Promise.all(
         done.map(async (d, i) =>
           [
-            `### Coder ${i + 1}: ${d.task}`,
+            `### Executor ${i + 1}: ${d.task}`,
             `Handoff document:\n${d.handoff}`,
-            `Coder report:\n${d.report}`,
+            `Executor report:\n${d.report}`,
             `Change:\n${(await changeOf($, d.paths)).slice(0, share)}`,
           ].join('\n\n'),
         ),
@@ -488,20 +488,18 @@ export const register: Register = on => {
       return { deny: `model-router: the last batch has not been reviewed. Spawn one ${REVIEWER_TYPE} with a brief first.` }
     const fixes = fixesBy.get(caller) ?? 0
     if (fromReviewer && fixes >= MAX_FIXES)
-      return { deny: `model-router: ${MAX_FIXES} fix coders used. Stop and report to Opus what still fails.` }
+      return { deny: `model-router: ${MAX_FIXES} fix executors used. Stop and report to Opus what still fails.` }
     if (!HANDOFF.every(h => e.prompt.includes(h)))
-      return { deny: `model-router: a coder prompt must be a handoff document with these headings:\n\n${TEMPLATE}` }
+      return { deny: `model-router: an executor prompt must be a handoff document with these headings:\n\n${TEMPLATE}` }
     const mine = filesOf(e.prompt)
     const steps = stepsIn(e.prompt)
-    if (mine.size === 0)
-      return { deny: 'model-router: list the absolute path of every file this coder may edit under ## Files.' }
     const clash = [...mine].filter(p => [...declared.values()].some(set => covers(set, p) || [...set].some(d => covers(mine, d))))
     if (clash.length > 0)
-      return { deny: `model-router: ${clash.join(', ')} already belong to a running coder. Give each coder its own files, or wait for it to finish.` }
+      return { deny: `model-router: ${clash.join(', ')} already belong to a running executor. Give each executor its own files, or wait for it to finish.` }
     if ([...stepsOf.values()].includes(steps))
-      return { deny: 'model-router: a running coder already has these ## Steps. Give each coder different instructions.' }
+      return { deny: 'model-router: a running executor already has these ## Steps. Give each executor different instructions.' }
     if (declared.size >= MAX_CODERS)
-      return { deny: `model-router: ${MAX_CODERS} coders are already running. Wait for one to finish.` }
+      return { deny: `model-router: ${MAX_CODERS} executors are already running. Wait for one to finish.` }
     if (fromReviewer) fixesBy.set(caller, fixes + 1)
     const call = e.tool_use_id ?? ''
     declared.set(call, mine)
@@ -532,7 +530,7 @@ export const register: Register = on => {
       <Box flexDirection="column">
         <Text bold color="green">● model-router active</Text>
         <Text>main chat  Opus 5.5 · high</Text>
-        <Text>edits      Haiku 5.5 · {list.length} coder{list.length === 1 ? '' : 's'} running</Text>
+        <Text>executors Haiku 5.5 · {list.length} running</Text>
         <Text>review     Sonnet 5.5{n > 0 ? ` · reviewing ${n}` : ''}</Text>
         <Text dimColor>today      {usage.map(([m, v]) => `${m} ${k(v)}`).join(' · ') || 'no usage yet'}</Text>
         {list.map(run => (

@@ -5,7 +5,7 @@ const HANDOFF = '## Goal\ng\n\n## Context\nc\n\n## Files\n/tmp/a.py\n\n## Steps\
 test('main chat cannot edit files', async ($, on) => {
   on('tool.call', () => ({ result: 'edited' }) as never)
   const r = await $.tool.call({ tool: 'Edit', file_path: 'a.py', old_string: 'a', new_string: 'b' })
-  expect(r.deny).toContain('model-router:coder')
+  expect(r.deny).toContain('model-router:executor')
 })
 
 test('coder always spawns on Haiku in the foreground', async ($, on) => {
@@ -14,19 +14,19 @@ test('coder always spawns on Haiku in the foreground', async ($, on) => {
     seen = { model: e.model, background: e.background }
     return { model: e.model ?? '', agentId: 'coder-1' }
   })
-  await $.agent.spawn({ subagentType: 'model-router:coder', prompt: HANDOFF, model: 'opus' } as never)
+  await $.agent.spawn({ subagentType: 'model-router:executor', prompt: HANDOFF, model: 'opus' } as never)
   expect(seen).toEqual({ model: 'claude-haiku-5-5', background: false })
 })
 
 test('coder prompt must be a handoff document', async ($, on) => {
   on('tool.call', () => ({ result: 'ran' }) as never)
-  const r = await $.tool.call({ tool: 'Agent', subagent_type: 'model-router:coder', description: 'x', prompt: 'just do it' })
+  const r = await $.tool.call({ tool: 'Agent', subagent_type: 'model-router:executor', description: 'x', prompt: 'just do it' })
   expect(r.deny).toContain('## Done when')
 })
 
 test('pane shows the router state on terminal and VS Code', async ($, on) => {
   on('agent.spawn', (_$, e) => ({ model: e.model ?? '', agentId: 'coder-1' }))
-  await $.agent.spawn({ subagentType: 'model-router:coder', prompt: HANDOFF, description: 'rename x' } as never)
+  await $.agent.spawn({ subagentType: 'model-router:executor', prompt: HANDOFF, description: 'rename x' } as never)
   for (const surface of ['terminal', 'vscode'] as const) {
     const ui = await $.ui.mount({
       plugin: 'model-router',
@@ -70,7 +70,7 @@ test('router-usage reports plan usage', async ($, on) => {
 test('finished coders cannot be resumed', async ($, on) => {
   on('agent.spawn', (_$, e) => ({ model: e.model ?? '', agentId: 'coder-9' }))
   on('tool.call', () => ({ result: 'sent' }) as never)
-  await $.agent.spawn({ subagentType: 'model-router:coder', prompt: HANDOFF, description: 'x' } as never)
+  await $.agent.spawn({ subagentType: 'model-router:executor', prompt: HANDOFF, description: 'x' } as never)
   const r = await $.tool.call({ tool: 'SendMessage', to: 'coder-9', message: 'one more thing' } as never)
   expect(JSON.stringify(r)).toContain('single-use')
 })
@@ -86,7 +86,7 @@ test('only absolute paths in ## Files lock files', async ($, on) => {
   const handoff = (files: string, steps = files) =>
     `## Goal\ng\n\n## Context\nc\n\n## Files\n${files}\n\n## Steps\n${steps}\n\n## Done when\nd`
   const agent = (files: string, steps?: string) =>
-    $.tool.call({ tool: 'Agent', subagent_type: 'model-router:coder', description: 'x', prompt: handoff(files, steps) } as never)
+    $.tool.call({ tool: 'Agent', subagent_type: 'model-router:executor', description: 'x', prompt: handoff(files, steps) } as never)
   const first = agent('/tmp/a.py, src/x.py, https://x.io and / here')
   const other = await agent('/tmp/b.py')
   const overlap = await agent('/tmp/a.py')
@@ -97,7 +97,30 @@ test('only absolute paths in ## Files lock files', async ($, on) => {
   expect(JSON.stringify(other)).not.toContain('already belong')
   expect(JSON.stringify(overlap)).toContain('already belong')
   expect(JSON.stringify(sameSteps)).toContain('different instructions')
-  expect(JSON.stringify(noFiles)).toContain('absolute path')
+  expect(JSON.stringify(noFiles)).not.toContain('absolute path') // no absolute path: a read-only executor, allowed through
+  expect(JSON.stringify(noFiles)).not.toContain('deny')
+})
+
+test('a heading named inside the Goal does not hide the real Files section', async ($, on) => {
+  let release = () => {}
+  const gate = new Promise<void>(resolve => (release = resolve))
+  let calls = 0
+  on('tool.call', async () => {
+    if (calls++ === 0) await gate
+    return { result: 'done' } as never
+  })
+  const agent = (goal: string, steps: string) =>
+    $.tool.call({
+      tool: 'Agent',
+      subagent_type: 'model-router:executor',
+      description: 'x',
+      prompt: `## Goal\n${goal}\n\n## Context\nc\n\n## Files\n/tmp/z.py\n\n## Steps\n${steps}\n\n## Done when\nd`,
+    } as never)
+  const first = agent('edit z.py, see the `## Files` section', 'one')
+  const second = await agent('g', 'two')
+  release()
+  await first
+  expect(JSON.stringify(second)).toContain('already belong')
 })
 
 test('router-usage reset clears the counters', async ($, on) => {
