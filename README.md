@@ -105,7 +105,7 @@ For readers who want to know exactly what the plugin does. It is a Claude Code p
 | Role | Model | Enforced by |
 |---|---|---|
 | Main chat | Opus 5.5, high effort | every main-chat model request is rewritten to `claude-opus-5-5` / `high`; a system-prompt section teaches Opus the protocol |
-| Operations | Haiku 5.5, high effort | Opus hands every well-defined operation (search and read files, map folders, edit, move or create files, run commands, fetch or scrape web pages) to `model-router:executor` subagents, which always run on `claude-haiku-5-5` in the foreground; `Edit`/`Write`/`NotebookEdit` are denied outside executors |
+| Operations | Haiku 5.5, high effort | Opus hands every well-defined operation (search and read files, map folders, edit, move or create files, run commands, fetch or scrape web pages) to `model-router:executor` subagents, which always run on `claude-haiku-5-5` in the foreground; `Edit`/`Write`/`NotebookEdit` and file-changing shell commands are denied outside executors that list files |
 | Handoff | — | an executor prompt without the headings `## Goal`, `## Context`, `## Files`, `## Steps`, `## Done when` is refused with the template |
 | Parallel work | Haiku 5.5 | Opus splits work into independent pieces and spawns one executor per piece in one message (usually 1–3), so they run at once; 8 is a hard cap, not a target |
 | File locks | — | an executor that changes files lists them (absolute paths in its Files section) and gets its own Steps: the files are locked to it, overlapping files or repeated Steps are refused, and it cannot edit outside its list; an executor with "none" in its Files section is read-only: it locks nothing and cannot edit |
@@ -201,8 +201,7 @@ The models are constants at the top of `hooks/register.tsx`: `MAIN` (Opus), `COD
 
 ### Known limits
 
-- The main chat can still change files through Bash (`sed -i`, heredocs).
-- Read-only executors are held to "no edits" for the Edit and Write tools only; a shell command (`mv`, `rm`) is not checked.
+- Shell writes are caught by a regex (`rm`, `mv`, `cp`, `sed -i`, `>` redirects, `git restore`/`reset`/`clean`...), not a shell parser: scripts such as `python -c` slip past, and a quoted `>` in a read-only command is refused. Only executors whose handoff lists files may run them.
 - Finished agents stay listed in VS Code's Agent map until Claude Code drops them; the plugin API cannot remove them (they can no longer be resumed).
 - A subagent that fills its context is not compacted: it ends, and Opus re-delegates a smaller task.
 - Executor bookkeeping lives in memory: a hot reload while an executor runs denies that executor's edits and drops the unreviewed batch (the reviewer then answers "nothing to review"); re-delegate.

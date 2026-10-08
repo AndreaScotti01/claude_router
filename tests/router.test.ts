@@ -8,6 +8,29 @@ test('main chat cannot edit files', async ($, on) => {
   expect(r.deny).toContain('model-router:executor')
 })
 
+test('shell writes are routed like edits', async ($, on) => {
+  let release = () => {}
+  const gate = new Promise<void>(resolve => (release = resolve))
+  on('agent.spawn', (_$, e) => ({ model: e.model ?? '', agentId: `coder-${e.description}` }))
+  on('tool.call', async (_$, e) => {
+    if (e.tool === 'Agent') await gate
+    return { result: 'ran' } as never
+  })
+  const handoff = (files: string) => `## Goal\ng\n\n## Context\nc\n\n## Files\n${files}\n\n## Steps\ns\n\n## Done when\nd`
+  const bash = (command: string, agentId?: string) => $.tool.call({ tool: 'Bash', command, agentId } as never)
+  expect(JSON.stringify(await bash('sed -i s/a/b/ /tmp/x'))).toContain('model-router:executor')
+  expect(JSON.stringify(await bash('cat > /tmp/x <<EOF'))).toContain('model-router:executor')
+  expect((await bash('grep -rn foo . 2>/dev/null | head')).deny).toBeUndefined()
+  expect((await bash('ls && echo a >&2')).deny).toBeUndefined()
+  await $.agent.spawn({ subagentType: 'model-router:executor', prompt: handoff('none'), description: 'none', tool_use_id: 't-none' } as never)
+  expect(JSON.stringify(await bash('rm /tmp/x', 'coder-none'))).toContain('lists none')
+  await $.agent.spawn({ subagentType: 'model-router:executor', prompt: handoff('/tmp/x'), description: 'list', tool_use_id: 't-list' } as never)
+  const running = $.tool.call({ tool: 'Agent', tool_use_id: 't-list', subagent_type: 'model-router:executor', description: 'list', prompt: handoff('/tmp/x') } as never)
+  expect((await bash('rm /tmp/x', 'coder-list')).deny).toBeUndefined()
+  release()
+  await running
+})
+
 test('coder always spawns on Haiku in the foreground', async ($, on) => {
   let seen: { model?: string; background?: boolean } = {}
   on('agent.spawn', (_$, e) => {

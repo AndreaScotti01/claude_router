@@ -9,6 +9,8 @@ const REVIEWER_TYPE = 'model-router:reviewer'
 const MAX_CODERS = 8
 const MAX_FIXES = 5 // fix coders one reviewer may spawn before it must report what still fails
 const EDIT_TOOLS = ['Edit', 'Write', 'NotebookEdit']
+const BASH_WRITE =
+  /(?:^|[;&|(`]|\$\(|\bxargs|-exec(?:dir)?)\s*(?:sudo\s+)?(?:rm|rmdir|mv|cp|ln|tee|touch|truncate|dd|mkdir|chmod|chown|unlink|patch)\b|\s-delete\b|\b(?:sed|perl)\b[^|;&]*\s-[a-zA-Z]*i|(?<![=\-<>&])>>?(?![&=]|\s*\/dev\/null\b)|\bgit(?:\s+-C\s+\S+)?\s+(?:restore|reset|clean|apply|stash|mv|rm|checkout\s+--)\b/
 const HANDOFF = ['## Goal', '## Context', '## Files', '## Steps', '## Done when']
 const MAX_CHARS = 100_000
 
@@ -446,6 +448,16 @@ export const register: Register = on => {
     }
     return next(e)
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'model-router: edit guard failed.' }))
+
+  // Shell writes follow the same rule: only an executor whose handoff lists files may run them.
+  on('tool.call', { tool: 'Bash' }, ($, e, next) => {
+    const tool = [...agentOf].find(([, a]) => a === e.agentId)?.[0] ?? ''
+    const { command } = e as unknown as { command?: string }
+    if ((declared.get(tool)?.size ?? 0) > 0 || !BASH_WRITE.test(command ?? '')) return next(e)
+    return files.has(e.agentId ?? '')
+      ? { deny: 'model-router: this command changes files and your handoff lists none. Report it as not done.' }
+      : { deny: `model-router: this command changes files. Delegate it to ${CODER_TYPE} with a handoff document that lists them.` }
+  })
 
   // Coders are single-use: a finished coder is never resumed, so every Haiku session starts fresh.
   on('tool.call', { tool: 'SendMessage' }, ($, e, next) =>
