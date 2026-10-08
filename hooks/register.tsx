@@ -7,6 +7,7 @@ const REVIEWER = 'claude-sonnet-5-5'
 const CODER_TYPE = 'model-router:coder'
 const REVIEWER_TYPE = 'model-router:reviewer'
 const MAX_CODERS = 8
+const MAX_FIXES = 5 // fix coders one reviewer may spawn before it must report what still fails
 const EDIT_TOOLS = ['Edit', 'Write', 'NotebookEdit']
 const HANDOFF = ['## Goal', '## Context', '## Files', '## Steps', '## Done when']
 const MAX_CHARS = 100_000
@@ -16,8 +17,15 @@ const PROTOCOL = [
   `- You plan, explain and talk to the user. You cannot edit files: every change goes to ${CODER_TYPE} subagents (Haiku 5.5).`,
   `- Each coder prompt must be a handoff document with these headings, in order: ${HANDOFF.join(', ')}. Coders start with no context: put in it everything they need (absolute paths, snippets, conventions, the user's intent).`,
   `- Split every change by file: spawn one coder per independent file group, all in ONE message so they run in parallel. Usually that is 1 to 3 coders; ${MAX_CODERS} is a hard cap, not a target, so never split work just to use more coders. Each coder must get its own files (absolute paths under ## Files, locked to that coder) and its own ## Steps; overlapping files, repeated Steps or more than ${MAX_CODERS} running coders are refused, and a coder cannot edit outside its list.`,
-  '- When every coder of a batch has finished, one Sonnet 5.5 reviewer agent reviews and tests the whole batch against your handoff documents, your notes and the user request; its report is appended to the last coder result. Fix what it finds (new coders) before reporting to the user.',
+  `- When all coders of a batch have returned, spawn exactly one ${REVIEWER_TYPE} (Sonnet 5.5) with a brief: the user's request, what you intended, what each coder reported, and what to test. The router attaches every handoff and diff. Sonnet tests, sends failures to fresh Haiku coders until they pass (up to ${MAX_FIXES}), and reports back to you; relay its outcome to the user. New coders are refused until the batch is reviewed.`,
   '- Coders and reviewers are single-use and pruned when done: you are the only stateful session. Never SendMessage a finished agent; spawn a fresh one with a new handoff document.',
+].join('\n')
+
+const REVIEW_LOOP = [
+  'Your job, in order:',
+  '1. Check every change above against its handoff and the brief. Run the relevant tests, or a one-off check when there are none.',
+  `2. If something fails or is wrong, do not edit: spawn fresh ${CODER_TYPE} agents with handoff documents (${HANDOFF.join(', ')}; absolute paths under ## Files), one per independent file group, all in one message, then re-test. Repeat until everything passes, at most ${MAX_FIXES} fix coders in all.`,
+  '3. Report to Opus: what you checked and ran, what you fixed, and anything still failing with file:line. Say "All checks pass." when nothing is left.',
 ].join('\n')
 
 const TEMPLATE = HANDOFF.map(h => `${h}\n...`).join('\n\n')
@@ -50,6 +58,7 @@ const declared = new Map<string, Set<string>>() // Agent tool_use_id -> absolute
 const spent = new Set<string>() // every coder/reviewer agentId and name: they are single-use
 const stepsOf = new Map<string, string>() // Agent tool_use_id -> its handoff's ## Steps: no two running coders get the same instructions
 const reviewers = new Set<string>() // reviewer agentIds, metered as 'review'
+const fixesBy = new Map<string, number>() // reviewer agentId -> fix coders it has spawned
 type Done = { task: string; handoff: string; report: string; paths: string[] }
 let batch: Done[] = [] // finished coders waiting for the batch review
 // ponytail: these maps reset on hot reload; a coder caught mid-run by one gets its edits denied, re-delegate
@@ -67,6 +76,13 @@ const k = (n: number) =>
 const base = (path: string) => path.slice(path.lastIndexOf('/') + 1)
 const empty = (): Row => ({ calls: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 })
 const tokens = (r: Row) => r.input + r.output + r.cacheRead + r.cacheWrite
+// API list prices, $ per million tokens: [input, output, cache read]; cache writes are billed at the 1-hour rate (2× input).
+// The plan meter is not published: API cost is the closest public proxy for how much a call weighs on it.
+const PRICE: Record<string, [number, number, number]> = { opus: [4, 20, 0.2], sonnet: [2, 10, 0.2], haiku: [0.1, 0.5, 0.01] }
+const cost = (model: string, r: Row) => {
+  const [i, o, cr] = PRICE[short(model)] ?? [4, 20, 0.2]
+  return (r.input * i + r.cacheWrite * 2 * i + r.output * o + r.cacheRead * cr) / 1e6
+}
 const fromUsage = (u: ModelUsage): Row => ({
   calls: 1,
   input: u.input_tokens,
@@ -126,12 +142,33 @@ const usageLine = () =>
 type Plan = { at: number; rateLimits: SessionRateLimit[] }
 let writes: Promise<unknown> = Promise.resolve()
 
+// Learn % of plan per API $ from moments the plan moved while this computer spent (store key 'spent' = API $ metered here, never reset).
+type Calibration = Record<string, { at: { resetsAt?: string; p: number; c: number }; rate?: number }>
+const STEP = 5 // plan points per sample: smaller moves are dominated by the rounding of percentUsed
+const sameWindow = (a?: string, b?: string) => a === b || Math.abs(Date.parse(a ?? '') - Date.parse(b ?? '')) < HOUR
+async function calibrate($: EngineInterface, rateLimits: SessionRateLimit[]) {
+  const spent = ((await $.store.get('spent')) as number | undefined) ?? 0
+  const cal = ((await $.store.get('calibration')) ?? {}) as Calibration
+  for (const l of rateLimits) {
+    const entry = cal[l.kind]
+    const now = { resetsAt: l.resetsAt, p: l.percentUsed, c: spent }
+    if (!entry || !sameWindow(entry.at.resetsAt, l.resetsAt) || l.percentUsed < entry.at.p) cal[l.kind] = { ...entry, at: now }
+    else if (l.percentUsed - entry.at.p >= STEP) {
+      // ponytail: other devices only push a sample up, so the lowest rate is kept; rounding can make it up to 1/STEP low
+      if (spent > entry.at.c) entry.rate = Math.min(entry.rate ?? Infinity, (l.percentUsed - entry.at.p) / (spent - entry.at.c))
+      entry.at = now
+    }
+  }
+  await $.store.set('calibration', cal)
+}
+
 // The plan % is account-wide (every device and session); the last reading is kept so a fresh session can show it.
 async function planReading($: EngineInterface): Promise<Plan | undefined> {
   const { rateLimits } = await $.session.usage()
   if (rateLimits.length === 0) return (await $.store.get('plan')) as Plan | undefined
   const plan = { at: Date.now(), rateLimits: [...rateLimits] }
   await $.store.set('plan', plan)
+  await calibrate($, rateLimits)
   return plan
 }
 const when = (t: number) => {
@@ -146,6 +183,7 @@ function meter($: EngineInterface, part: Part, model: string, row: Row) {
       ledger = ((await $.store.get('usage')) ?? {}) as Ledger
       addTo(((ledger[hour()] ??= {})[`${part}:${model}`] ??= empty()), row)
       await $.store.set('usage', ledger)
+      if (part !== 'handoff') await $.store.set('spent', (((await $.store.get('spent')) as number | undefined) ?? 0) + cost(model, row))
       await planReading($)
     })
     .catch(() => undefined)
@@ -181,58 +219,44 @@ async function changeOf($: EngineInterface, paths: string[]) {
 
 async function report($: EngineInterface) {
   const plan = await planReading($)
+  ledger = ((await $.store.get('usage')) ?? ledger) as Ledger // include other sessions on this computer
   const now = Date.now()
-  const win = (kind: string, ms: number) => {
-    const r = plan?.rateLimits.find(l => l.kind === kind)
-    const end = r?.resetsAt ? Date.parse(r.resetsAt) : 0
-    if (!r) return { used: 'no reading yet', left: '—', start: now - ms }
-    if (end && end <= now) return { used: 'reset since the last reading', left: '—', start: now - ms }
-    return { used: `${r.percentUsed}%`, left: end ? dur(end - now) : '—', start: end ? end - ms : now - ms }
-  }
-  const session = win('five_hour', 5 * HOUR)
-  const week = win('seven_day', 7 * 24 * HOUR)
-  const from = ((await $.store.get('since')) as number | undefined) ?? Math.min(now, ...Object.keys(ledger).map(bucketStart))
+  const r = plan?.rateLimits.find(l => l.kind === 'five_hour')
+  const end = r?.resetsAt ? Date.parse(r.resetsAt) : 0
+  const live = r !== undefined && !(end && end <= now)
+  const w = plan?.rateLimits.find(l => l.kind === 'seven_day')
+  const wEnd = w?.resetsAt ? Date.parse(w.resetsAt) : 0
+  const cell = (l: SessionRateLimit | undefined, e: number) =>
+    !l ? 'no reading yet | —' : e && e <= now ? 'reset since the last reading | —' : `${l.percentUsed}% | ${e ? dur(e - now) : '—'}`
   const lines = [
-    `**Account plan: all your devices and sessions**${plan ? ` (Anthropic's reading from ${when(plan.at)})` : ''}`,
+    `**Account plan: all your devices**${plan ? ` (reading from ${when(plan.at)})` : ''}`,
     '',
     '| window | used | resets in |',
     '|---|--:|--:|',
-    `| session (5h) | ${session.used} | ${session.left} |`,
-    `| week (7d) | ${week.used} | ${week.left} |`,
-    '',
-    `**model-router on this computer** (counting since ${when(from)}): only sessions on this computer with the router loaded. Other devices, and sessions without the router, count in the plan above but not here.`,
+    `| session (5h) | ${cell(r, end)} |`,
+    `| week (7d) | ${cell(w, wEnd)} |`,
   ]
-  const cols = [since(midnight()), since(session.start), since(week.start)]
-  const byPart = cols.map(rows => {
-    const out = Object.fromEntries(PARTS.map(([p]) => [p, empty()])) as Record<Part, Row>
-    for (const [id, r] of Object.entries(rows)) addTo(out[partOf(id)], r)
-    return out
-  })
-  const outs = byPart.map(p => PARTS.reduce((t, [part]) => (part === 'handoff' ? t : t + p[part].output), 0))
-  if (outs.every(o => o === 0)) return [...lines, '', 'No usage recorded yet.'].join('\n')
+  const rows = since(live && end ? end - 5 * HOUR : now - 5 * HOUR)
+  const byPart = Object.fromEntries(PARTS.map(([p]) => [p, 0])) as Record<Part, number>
+  for (const [id, row] of Object.entries(rows)) byPart[partOf(id)] += cost(modelOf(id), row)
+  const sum = PARTS.reduce((t, [part]) => (part === 'handoff' ? t : t + byPart[part]), 0)
+  if (sum === 0) return [...lines, '', 'No router usage on this computer in this session yet.'].join('\n')
+  const rate = ((await $.store.get('calibration')) as Calibration | undefined)?.five_hour?.rate
+  const pts = (c: number) => (rate === undefined ? 'calibrating' : `≈ ${c * rate < 0.1 ? '<0.1' : (c * rate).toFixed(1)}%`)
   const models = (part: Part) =>
-    [...new Set(Object.keys(cols[2] ?? {}).filter(id => partOf(id) === part).map(id => short(modelOf(id))))].join(', ') || '—'
-  lines.push('', '| part | model | today | session (5h) | week (7d) |', '|---|---|--:|--:|--:|')
+    [...new Set(Object.keys(rows).filter(id => partOf(id) === part).map(id => short(modelOf(id))))].join(', ') || '—'
+  lines.push('', "| part | model | share of this computer's usage | of the plan session |", '|---|---|--:|--:|')
   for (const [part, label] of PARTS) {
-    const cells = byPart.map((p, i) => {
-      const out = p[part].output
-      const sum = outs[i] ?? 0
-      if (out === 0 || sum === 0) return '—'
-      const share = (out / sum) * 100
-      return `${share < 1 ? '<1' : Math.round(share)}% · ${k(out)} out`
-    })
-    lines.push(`| ${label} | ${models(part)} | ${cells.join(' | ')} |`)
+    const c = byPart[part]
+    if (c === 0) continue
+    const share = (c / sum) * 100
+    lines.push(`| ${label} | ${models(part)} | ${share < 1 ? '<1' : Math.round(share)}% | ${pts(c)} |`)
   }
-  lines.push(`| **total** | | ${outs.map(o => `**${k(o)} out**`).join(' | ')} |`)
-  lines.push('', '**Last 7 days in detail**', '', '| part | calls | output | new input | cache write | cache read |', '|---|--:|--:|--:|--:|--:|')
-  for (const [part, label] of PARTS) {
-    const r = byPart[2]?.[part] ?? empty()
-    if (r.calls > 0)
-      lines.push(`| ${label} | ${Math.round(r.calls)} | ${k(r.output)} | ${k(r.input)} | ${k(r.cacheWrite)} | ${k(r.cacheRead)} |`)
-  }
+  const total = rate === undefined ? 'calibrating' : `${pts(sum)} of session${live ? ` (${r?.percentUsed}%)` : ''}`
+  lines.push(`| **total** | | **100%** | **${total}** |`)
   lines.push(
     '',
-    '_% = share of output tokens (what each model generated). Cache reads re-read earlier context: cheap, so they are listed apart and not used for shares. The plan % is not split by part because it includes usage the router never sees. Handoff docs are estimated (4 characters ≈ 1 token) and are part of Opus chat output. `/router-usage reset` clears these counters._',
+    '_Only sessions on this computer with the router loaded. Share weighs each part by API list price (cache writes weigh more than output, cache reads little). "Of the plan session" is learned from moments the plan moved 5+ points while this computer worked, and says "calibrating" until then. Handoff docs are estimated and are part of Opus chat. `/router-usage reset` clears the counters._',
   )
   return lines.join('\n')
 }
@@ -277,21 +301,22 @@ export const register: Register = on => {
       prompt:
         'You are a coder. You get a handoff document (Goal, Context, Files, Steps, Done when). Do exactly the Steps and edit only the files listed under Files: other coders may be editing other files in parallel. Smallest diff that works, match the surrounding style. Finish with the files you changed and anything you could not do.',
       model: CODER,
-      effort: 'medium',
+      effort: 'high',
       disallowedTools: ['Agent'],
     })
     await $.agent.register({
       name: 'reviewer',
-      description: 'Sonnet 5.5 batch reviewer, started by the router after each batch of coders. Do not spawn it yourself.',
+      description:
+        'Sonnet 5.5 batch reviewer: spawn exactly one after all coders of a batch have returned, with a brief (request, intent, coder reports, what to test). It tests, sends failures to fresh Haiku coders until they pass, and reports back.',
       prompt:
-        'You review and test one batch of changes that Haiku coders made from handoff documents Opus wrote. Read the changed files and run the relevant tests or checks. Never edit files. Report real bugs per coder, most severe first, each with file:line and a fix. Say "No issues." if none.',
+        'You review and test one batch of changes that Haiku coders made from handoff documents Opus wrote. You never edit files: every fix goes to a fresh model-router:coder with a handoff document. Follow the steps at the end of your prompt.',
       model: REVIEWER,
       effort: 'high',
-      disallowedTools: ['Agent', 'Edit', 'Write', 'NotebookEdit'],
+      disallowedTools: ['Edit', 'Write', 'NotebookEdit'],
     })
     await $.command.register({
       name: 'router-usage',
-      description: "Account plan % and where this computer's router tokens went; 'reset' clears the counters (model-router)",
+      description: "Plan session % and this computer's router share of it; 'reset' clears the counters (model-router)",
       argumentHint: 'reset',
     })
     await $.command.register({ name: 'router', description: 'Show model-router status and open its pane' })
@@ -317,9 +342,9 @@ export const register: Register = on => {
     e.agentId ? { skip: 'model-router: subagents are single-use and are not compacted.' } : next(e),
   )
 
-  // Router: main chat on Opus at high effort, coders at medium, reviewers at high (the session's effort setting stays Opus's); every request is metered by part.
+  // Router: main chat, coders and reviewers all at high effort (the session's effort setting does not apply); every request is metered by part.
   on('turn.step', async function* ($, e, next) {
-    const effort = !e.agentId ? 'high' : files.has(e.agentId) ? 'medium' : reviewers.has(e.agentId) ? 'high' : e.effort
+    const effort = !e.agentId || files.has(e.agentId) || reviewers.has(e.agentId) ? 'high' : e.effort
     const r = yield* next(!e.agentId ? { ...e, model: MAIN, effort: 'high' } : { ...e, effort })
     const part: Part = !e.agentId ? 'chat' : files.has(e.agentId) ? 'coder' : reviewers.has(e.agentId) ? 'review' : 'subagent'
     if (r.usage) await meter($, part, r.usage.model, fromUsage(r.usage))
@@ -344,7 +369,7 @@ export const register: Register = on => {
       agentOf.set(e.tool_use_id, id)
       spent.add(id)
       if (e.name) spent.add(e.name)
-      await update($, runs, list => [...list, { id, task: e.description, files: [] }])
+      await update($, runs, list => [...list.filter(run => files.has(run.id)), { id, task: e.description, files: [] }])
     }
     return r
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'model-router: coder routing failed.' }))
@@ -378,9 +403,41 @@ export const register: Register = on => {
       : next(e),
   )
 
-  // Coder prompts must be handoff documents; each finished change gets a Sonnet review with Opus's context.
+  // Opus hands off to Haiku coders. Once they have all returned, Opus briefs one Sonnet reviewer, which gets every handoff
+  // and diff, tests, and sends failures to fresh Haiku coders until they pass. (A plugin cannot start agents through
+  // $.tool.call, so the review is a spawn Opus makes, not one the router makes.)
   on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
+    const caller = e.agentId ?? ''
+    const fromReviewer = reviewers.has(caller)
+    if (fromReviewer && e.subagent_type !== CODER_TYPE)
+      return { deny: `model-router: the reviewer can only spawn ${CODER_TYPE} agents to fix what fails.` }
+    if (e.subagent_type === REVIEWER_TYPE) {
+      if (caller) return { deny: 'model-router: only the main chat starts the reviewer.' }
+      if (declared.size > 0) return { deny: 'model-router: coders are still running. Start the reviewer once they have all returned.' }
+      if (batch.length === 0) return { deny: 'model-router: nothing to review: no coder changed a file since the last review.' }
+      const done = batch
+      batch = []
+      const share = Math.floor(MAX_CHARS / done.length)
+      const changes = await Promise.all(
+        done.map(async (d, i) =>
+          [
+            `### Coder ${i + 1}: ${d.task}`,
+            `Handoff document:\n${d.handoff}`,
+            `Coder report:\n${d.report}`,
+            `Change:\n${(await changeOf($, d.paths)).slice(0, share)}`,
+          ].join('\n\n'),
+        ),
+      )
+      await meter($, 'handoff', MAIN, { calls: 1, input: 0, output: Math.round(e.prompt.length / 4), cacheRead: 0, cacheWrite: 0 })
+      await update($, lastReview, () => `started ${new Date().toTimeString().slice(0, 5)} for ${done.length} change${done.length === 1 ? '' : 's'}`)
+      return next({ ...e, prompt: [`Brief from Opus:\n${e.prompt}`, ...changes, REVIEW_LOOP].join('\n\n') })
+    }
     if (e.subagent_type !== CODER_TYPE) return next(e)
+    if (!caller && batch.length > 0 && declared.size === 0)
+      return { deny: `model-router: the last batch has not been reviewed. Spawn one ${REVIEWER_TYPE} with a brief first.` }
+    const fixes = fixesBy.get(caller) ?? 0
+    if (fromReviewer && fixes >= MAX_FIXES)
+      return { deny: `model-router: ${MAX_FIXES} fix coders used. Stop and report to Opus what still fails.` }
     if (!HANDOFF.every(h => e.prompt.includes(h)))
       return { deny: `model-router: a coder prompt must be a handoff document with these headings:\n\n${TEMPLATE}` }
     const mine = filesOf(e.prompt)
@@ -394,10 +451,11 @@ export const register: Register = on => {
       return { deny: 'model-router: a running coder already has these ## Steps. Give each coder different instructions.' }
     if (declared.size >= MAX_CODERS)
       return { deny: `model-router: ${MAX_CODERS} coders are already running. Wait for one to finish.` }
+    if (fromReviewer) fixesBy.set(caller, fixes + 1)
     const call = e.tool_use_id ?? ''
     declared.set(call, mine)
     stepsOf.set(call, steps)
-    await meter($, 'handoff', MAIN, { calls: 1, input: 0, output: Math.round(e.prompt.length / 4), cacheRead: 0, cacheWrite: 0 })
+    await meter($, 'handoff', fromReviewer ? REVIEWER : MAIN, { calls: 1, input: 0, output: Math.round(e.prompt.length / 4), cacheRead: 0, cacheWrite: 0 })
     const r = await next(e).finally(() => {
       declared.delete(call)
       stepsOf.delete(call)
@@ -406,43 +464,11 @@ export const register: Register = on => {
     const paths = [...(files.get(id) ?? [])]
     files.delete(id)
     agentOf.delete(call)
-    await update($, runs, list => list.filter(run => run.id !== id))
-    if (r.deny === undefined && !r.isError && paths.length > 0)
+    if (!fromReviewer && r.deny === undefined && !r.isError && paths.length > 0)
       batch.push({ task: e.description, handoff: e.prompt, report: r.text ?? '', paths })
-    // The last coder of a batch to finish starts one Sonnet reviewer for the whole batch.
-    if (declared.size > 0 || batch.length === 0) return r
-    const done = batch
-    batch = []
-    await update($, reviewing, n => n + 1)
-    try {
-      const msgs = await $.session.messages()
-      const share = Math.floor(MAX_CHARS / done.length)
-      const changes = await Promise.all(
-        done.map(async (d, i) =>
-          [
-            `### Coder ${i + 1}: ${d.task}`,
-            `Handoff document:\n${d.handoff}`,
-            `Coder report:\n${d.report}`,
-            `Change:\n${(await changeOf($, d.paths)).slice(0, share)}`,
-          ].join('\n\n'),
-        ),
-      )
-      const ran = await $.tool.call({
-        tool: 'Agent',
-        subagent_type: REVIEWER_TYPE,
-        description: `Review ${done.length} coder change${done.length === 1 ? '' : 's'}`,
-        prompt: [`User request:\n${lastText(msgs, 'user')}`, `Opus notes:\n${lastText(msgs, 'assistant')}`, ...changes].join('\n\n'),
-        run_in_background: false,
-      } as never)
-      const text = ran.deny ?? ran.text ?? 'The reviewer returned nothing.'
-      $.ui.toast(`Sonnet 5.5 review: ${text.split('\n')[0]?.slice(0, 120) ?? ''}`, { timeoutMs: 8000 })
-      await update($, lastReview, () => text.split('\n')[0]?.slice(0, 200) ?? '')
-      const note = `Sonnet 5.5 review of this batch (${done.length} coder${done.length === 1 ? '' : 's'}):\n${text}`
-      return r.deny !== undefined ? r : { ...r, context: [...(r.context ?? []), note] }
-    } finally {
-      await update($, reviewing, n => n - 1)
-    }
-  })
+    await update($, runs, list => list.filter(run => run.id !== id))
+    return r
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: 'model-router: agent routing failed.' }))
 
   // Every surface, VS Code included: a live pane with the router's state.
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
