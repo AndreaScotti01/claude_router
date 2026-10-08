@@ -68,7 +68,7 @@ const bucketStart = (key: string) => Date.parse(key.length === 10 ? `${key}T00:0
 const bucketEnd = (key: string) => bucketStart(key) + (key.length === 10 ? 24 : 1) * HOUR
 const partOf = (id: string): Part =>
   id.includes(':') ? (id.split(':')[0] as Part) : id.includes('haiku') ? 'coder' : id.includes('sonnet') ? 'review' : 'chat'
-const modelOf = (id: string) => id.slice(id.indexOf(':') + 1)
+const modelOf = (id: string) => id.slice(id.indexOf(':') + 1).split('|')[0] ?? '' // 'part:model|sessionId' (old rows: 'part:model')
 const midnight = () => new Date().setHours(0, 0, 0, 0)
 const short = (model: string) => model.replace(/^claude-/, '').split('-')[0] ?? model
 const k = (n: number) =>
@@ -139,6 +139,26 @@ const totals = () => {
 const usageLine = () =>
   `router · today ${Object.entries(totals()).map(([m, v]) => `${m} ${k(v)}`).join(' · ') || 'no usage yet'}`
 
+// One file per computer, shared by every chat and every copy of the plugin (dev folder or installed); $.store is per copy.
+// ponytail: whole-file read-modify-write; two chats writing in the same instant can drop one update
+const DB = '.claude/model-router-usage.json'
+async function dbPath($: EngineInterface) {
+  return `${(await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? '.'}/${DB}`
+}
+async function dbAll($: EngineInterface): Promise<Record<string, unknown>> {
+  try {
+    return JSON.parse(String(await $.fs.read(await dbPath($)))) as Record<string, unknown>
+  } catch {
+    return {}
+  }
+}
+async function dbGet($: EngineInterface, key: string) {
+  return (await dbAll($))[key]
+}
+async function dbSet($: EngineInterface, key: string, value: unknown) {
+  return $.fs.write(await dbPath($), JSON.stringify({ ...(await dbAll($)), [key]: value }))
+}
+
 type Plan = { at: number; rateLimits: SessionRateLimit[] }
 let writes: Promise<unknown> = Promise.resolve()
 
@@ -147,8 +167,8 @@ type Calibration = Record<string, { at: { resetsAt?: string; p: number; c: numbe
 const STEP = 5 // plan points per sample: smaller moves are dominated by the rounding of percentUsed
 const sameWindow = (a?: string, b?: string) => a === b || Math.abs(Date.parse(a ?? '') - Date.parse(b ?? '')) < HOUR
 async function calibrate($: EngineInterface, rateLimits: SessionRateLimit[]) {
-  const spent = ((await $.store.get('spent')) as number | undefined) ?? 0
-  const cal = ((await $.store.get('calibration')) ?? {}) as Calibration
+  const spent = ((await dbGet($, 'spent')) as number | undefined) ?? 0
+  const cal = ((await dbGet($, 'calibration')) ?? {}) as Calibration
   for (const l of rateLimits) {
     const entry = cal[l.kind]
     const now = { resetsAt: l.resetsAt, p: l.percentUsed, c: spent }
@@ -159,15 +179,15 @@ async function calibrate($: EngineInterface, rateLimits: SessionRateLimit[]) {
       entry.at = now
     }
   }
-  await $.store.set('calibration', cal)
+  await dbSet($, 'calibration', cal)
 }
 
 // The plan % is account-wide (every device and session); the last reading is kept so a fresh session can show it.
 async function planReading($: EngineInterface): Promise<Plan | undefined> {
   const { rateLimits } = await $.session.usage()
-  if (rateLimits.length === 0) return (await $.store.get('plan')) as Plan | undefined
+  if (rateLimits.length === 0) return (await dbGet($, 'plan')) as Plan | undefined
   const plan = { at: Date.now(), rateLimits: [...rateLimits] }
-  await $.store.set('plan', plan)
+  await dbSet($, 'plan', plan)
   await calibrate($, rateLimits)
   return plan
 }
@@ -180,10 +200,10 @@ const when = (t: number) => {
 function meter($: EngineInterface, part: Part, model: string, row: Row) {
   writes = writes
     .then(async () => {
-      ledger = ((await $.store.get('usage')) ?? {}) as Ledger
-      addTo(((ledger[hour()] ??= {})[`${part}:${model}`] ??= empty()), row)
-      await $.store.set('usage', ledger)
-      if (part !== 'handoff') await $.store.set('spent', (((await $.store.get('spent')) as number | undefined) ?? 0) + cost(model, row))
+      ledger = ((await dbGet($, 'usage')) ?? {}) as Ledger
+      addTo(((ledger[hour()] ??= {})[`${part}:${model}|${await $.session.id()}`] ??= empty()), row)
+      await dbSet($, 'usage', ledger)
+      if (part !== 'handoff') await dbSet($, 'spent', (((await dbGet($, 'spent')) as number | undefined) ?? 0) + cost(model, row))
       await planReading($)
     })
     .catch(() => undefined)
@@ -195,13 +215,13 @@ function meter($: EngineInterface, part: Part, model: string, row: Row) {
 
 async function reset($: EngineInterface) {
   await writes
-  await $.store.set('usageBeforeReset', (await $.store.get('usage')) ?? {}) // ponytail: one backup in the store file, no restore command
+  await dbSet($, 'usageBeforeReset', (await dbGet($, 'usage')) ?? {}) // ponytail: one backup in the store file, no restore command
   ledger = {}
-  await $.store.set('usage', ledger)
-  await $.store.set('since', Date.now())
+  await dbSet($, 'usage', ledger)
+  await dbSet($, 'since', Date.now())
   $.ui.status(usageLine())
   await update($, today, () => totals())
-  return "**model-router counters on this computer are reset.** The previous counters are kept once as `usageBeforeReset` in `~/.claude/plugins/store/model-router_*.json`. The account plan % is Anthropic's and is not affected."
+  return "**model-router counters on this computer are reset.** The previous counters are kept once as `usageBeforeReset` in `~/.claude/model-router-usage.json`. The account plan % is Anthropic's and is not affected."
 }
 
 async function changeOf($: EngineInterface, paths: string[]) {
@@ -219,7 +239,7 @@ async function changeOf($: EngineInterface, paths: string[]) {
 
 async function report($: EngineInterface) {
   const plan = await planReading($)
-  ledger = ((await $.store.get('usage')) ?? ledger) as Ledger // include other sessions on this computer
+  ledger = ((await dbGet($, 'usage')) ?? ledger) as Ledger // include other sessions on this computer
   const now = Date.now()
   const r = plan?.rateLimits.find(l => l.kind === 'five_hour')
   const end = r?.resetsAt ? Date.parse(r.resetsAt) : 0
@@ -236,27 +256,41 @@ async function report($: EngineInterface) {
     `| session (5h) | ${cell(r, end)} |`,
     `| week (7d) | ${cell(w, wEnd)} |`,
   ]
-  const rows = since(live && end ? end - 5 * HOUR : now - 5 * HOUR)
-  const byPart = Object.fromEntries(PARTS.map(([p]) => [p, 0])) as Record<Part, number>
-  for (const [id, row] of Object.entries(rows)) byPart[partOf(id)] += cost(modelOf(id), row)
-  const sum = PARTS.reduce((t, [part]) => (part === 'handoff' ? t : t + byPart[part]), 0)
-  if (sum === 0) return [...lines, '', 'No router usage on this computer in this session yet.'].join('\n')
-  const rate = ((await $.store.get('calibration')) as Calibration | undefined)?.five_hour?.rate
-  const pts = (c: number) => (rate === undefined ? 'calibrating' : `≈ ${c * rate < 0.1 ? '<0.1' : (c * rate).toFixed(1)}%`)
-  const models = (part: Part) =>
-    [...new Set(Object.keys(rows).filter(id => partOf(id) === part).map(id => short(modelOf(id))))].join(', ') || '—'
-  lines.push('', "| part | model | share of this computer's usage | of the plan session |", '|---|---|--:|--:|')
-  for (const [part, label] of PARTS) {
-    const c = byPart[part]
-    if (c === 0) continue
-    const share = (c / sum) * 100
-    lines.push(`| ${label} | ${models(part)} | ${share < 1 ? '<1' : Math.round(share)}% | ${pts(c)} |`)
+  const sid = await $.session.id()
+  const windows = [since(live && end ? end - 5 * HOUR : now - 5 * HOUR), since(w && wEnd > now ? wEnd - 7 * 24 * HOUR : now - 7 * 24 * HOUR)]
+  const cal = ((await dbGet($, 'calibration')) ?? {}) as Calibration
+  const rates = [cal.five_hour?.rate, cal.seven_day?.rate]
+  const from = ((await dbGet($, 'since')) as number | undefined) ?? Math.min(now, ...Object.keys(ledger).map(bucketStart))
+  const table = (title: string, keep: (id: string) => boolean) => {
+    const by = windows.map(rows => {
+      const c = Object.fromEntries(PARTS.map(([p]) => [p, 0])) as Record<Part, number>
+      for (const [id, row] of Object.entries(rows)) if (keep(id)) c[partOf(id)] += cost(modelOf(id), row)
+      return c
+    })
+    const sums = by.map(c => PARTS.reduce((t, [part]) => (part === 'handoff' ? t : t + c[part]), 0))
+    const week = sums[1] ?? 0
+    if (week === 0) return ['', title, '', 'No router usage yet.']
+    const pts = (c: number, i: number) => {
+      const rate = rates[i]
+      return rate === undefined ? 'calibrating' : c === 0 ? '—' : `≈ ${c * rate < 0.1 ? '<0.1' : (c * rate).toFixed(1)}%`
+    }
+    const models = (part: Part) =>
+      [...new Set(Object.keys(windows[1] ?? {}).filter(id => keep(id) && partOf(id) === part).map(id => short(modelOf(id))))].join(', ') || '—'
+    const out = ['', title, '', '| part | model | share | ≈ of session (5h) | ≈ of week (7d) |', '|---|---|--:|--:|--:|']
+    for (const [part, label] of PARTS) {
+      const c = by[1]?.[part] ?? 0
+      if (c === 0) continue
+      const share = (c / week) * 100
+      out.push(`| ${label} | ${models(part)} | ${share < 1 ? '<1' : Math.round(share)}% | ${pts(by[0]?.[part] ?? 0, 0)} | ${pts(c, 1)} |`)
+    }
+    out.push(`| **total** | | **100%** | **${pts(sums[0] ?? 0, 0)}** | **${pts(week, 1)}** |`)
+    return out
   }
-  const total = rate === undefined ? 'calibrating' : `${pts(sum)} of session${live ? ` (${r?.percentUsed}%)` : ''}`
-  lines.push(`| **total** | | **100%** | **${total}** |`)
   lines.push(
+    ...table('**This chat**', id => id.endsWith(`|${sid}`)),
+    ...table(`**All chats on this computer** (since ${when(from)})`, () => true),
     '',
-    '_Only sessions on this computer with the router loaded. Share weighs each part by API list price (cache writes weigh more than output, cache reads little). "Of the plan session" is learned from moments the plan moved 5+ points while this computer worked, and says "calibrating" until then. Handoff docs are estimated and are part of Opus chat. `/router-usage reset` clears the counters._',
+    '_Router usage only: chats on this computer with the router loaded; other devices count in the plan table but not here. Share weighs each part by API list price over the last 7 days. "≈ of session / week" = the plan points that usage cost, learned from moments the plan moved 5+ points while this computer worked ("calibrating" until then). Usage recorded before chats were tagged counts only under all chats. `/router-usage reset` clears the counters._',
   )
   return lines.join('\n')
 }
@@ -290,7 +324,13 @@ async function card($: EngineInterface) {
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    ledger = ((await $.store.get('usage')) ?? {}) as Ledger
+    // one-time move of this copy's old $.store data into the shared file
+    for (const key of ['usage', 'since', 'plan', 'spent', 'calibration'])
+      if ((await dbGet($, key)) === undefined) {
+        const old = await $.store.get(key).catch(() => undefined)
+        if (old !== undefined) await dbSet($, key, old)
+      }
+    ledger = ((await dbGet($, 'usage')) ?? {}) as Ledger
     const cutoff = Date.now() - KEEP_DAYS * 24 * HOUR
     for (const key of Object.keys(ledger)) if (bucketEnd(key) < cutoff) delete ledger[key]
     $.ui.status(usageLine())

@@ -57,6 +57,10 @@ test('command output is drawn as markdown on terminal and VS Code', async $ => {
 test('router-usage reports plan usage', async ($, on) => {
   on('store.get', () => ({ value: undefined }) as never)
   on('store.set', () => ({ value: undefined }) as never)
+  on('env.get', () => ({ value: '/home/test' }) as never)
+  on('fs.read', () => ({ value: '{}' }) as never)
+  on('fs.write', () => ({ value: undefined }) as never)
+  on('session.id', () => ({ value: 'chat-1' }) as never)
   on('session.usage', () => ({ value: { startedAt: 0, rateLimits: [{ kind: 'five_hour', percentUsed: 20 }] } }) as never)
   const r = await $.command.run({ command: 'router-usage', args: '' } as never)
   expect(JSON.stringify(r)).toContain('Account plan')
@@ -99,6 +103,10 @@ test('only absolute paths in ## Files lock files', async ($, on) => {
 test('router-usage reset clears the counters', async ($, on) => {
   on('store.get', () => ({ value: undefined }) as never)
   on('store.set', () => ({ value: undefined }) as never)
+  on('env.get', () => ({ value: '/home/test' }) as never)
+  on('fs.read', () => ({ value: '{}' }) as never)
+  on('fs.write', () => ({ value: undefined }) as never)
+  on('session.id', () => ({ value: 'chat-1' }) as never)
   const r = await $.command.run({ command: 'router-usage', args: 'reset' } as never)
   expect(JSON.stringify(r)).toContain('are reset')
 })
@@ -110,18 +118,23 @@ test('router-usage learns plan % per API dollar', async ($, on) => {
     calibration: { five_hour: { at: { resetsAt, p: 30, c: 5 } } },
     usage: {
       [new Date().toISOString().slice(0, 13)]: {
-        'chat:claude-opus-5-5': { calls: 1, input: 0, output: 100_000, cacheRead: 0, cacheWrite: 0 },
+        'chat:claude-opus-5-5|chat-1': { calls: 1, input: 0, output: 100_000, cacheRead: 0, cacheWrite: 0 },
       },
     },
   }
-  on('store.get', (_$, e: { key: string }) => ({ value: store[e.key] }) as never)
-  on('store.set', (_$, e: { key: string; value: unknown }) => {
-    store[e.key] = e.value
+  let file = JSON.stringify(store)
+  on('env.get', () => ({ value: '/home/test' }) as never)
+  on('fs.read', () => ({ value: file }) as never)
+  on('fs.write', (_$, e: { path: string; text: string }) => {
+    file = e.text
     return { value: undefined } as never
   })
+  on('session.id', () => ({ value: 'chat-1' }) as never)
   on('session.usage', () => ({ value: { startedAt: 0, rateLimits: [{ kind: 'five_hour', percentUsed: 40, resetsAt }] } }) as never)
   const r = await $.command.run({ command: 'router-usage', args: '' } as never)
-  expect((store.calibration as Record<string, { rate?: number }>).five_hour?.rate).toBe(2)
+  expect((JSON.parse(file) as { calibration: Record<string, { rate?: number }> }).calibration.five_hour?.rate).toBe(2)
+  expect(JSON.stringify(r)).toContain('This chat')
+  expect(JSON.stringify(r)).not.toContain('No router usage yet')
   expect(JSON.stringify(r)).toContain('of session')
 })
 
