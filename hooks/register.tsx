@@ -1,29 +1,34 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelUsage, Register, SessionMessage, SessionRateLimit } from 'claude-code'
 
-const MAIN = 'claude-opus-5-5'
-const CODER = 'claude-haiku-5-5'
-const REVIEWER = 'claude-sonnet-5-5'
+// Defaults; each can be overridden by a MODEL_ROUTER_* env var (README.md › Configure), read at session start.
+let MAIN = 'claude-opus-5-5'
+let MAIN_EFFORT = 'high'
+let CODER = 'claude-haiku-5-5'
+let CODER_EFFORT = 'high'
+let REVIEWER = 'claude-sonnet-5-5'
+let REVIEWER_EFFORT = 'high'
 const CODER_TYPE = 'model-router:executor'
 const REVIEWER_TYPE = 'model-router:reviewer'
-const MAX_CODERS = 8
-const MAX_FIXES = 5 // fix coders one reviewer may spawn before it must report what still fails
+let MAX_CODERS = 8
+let MAX_FIXES = 5 // fix coders one reviewer may spawn before it must report what still fails
 const EDIT_TOOLS = ['Edit', 'Write', 'NotebookEdit']
 const BASH_WRITE =
   /(?:^|[;&|(`]|\$\(|\bxargs|-exec(?:dir)?)\s*(?:sudo\s+)?(?:rm|rmdir|mv|cp|ln|tee|touch|truncate|dd|mkdir|chmod|chown|unlink|patch)\b|\s-delete\b|\b(?:sed|perl)\b[^|;&]*\s-[a-zA-Z]*i|(?<![=\-<>&])>>?(?![&=]|\s*\/dev\/null\b)|\bgit(?:\s+-C\s+\S+)?\s+(?:restore|reset|clean|apply|stash|mv|rm|checkout\s+--)\b/
 const HANDOFF = ['## Goal', '## Context', '## Files', '## Steps', '## Done when']
-const MAX_CHARS = 100_000
+let MAX_CHARS = 100_000
+let MAX_DIRECT = 6 // tool calls the main chat may make in a row before it must hand off
 
-const PROTOCOL = [
+const protocol = () => [
   'Model router (enforced by the model-router plugin):',
-  `- You plan, explain and talk to the user. Hand operations to ${CODER_TYPE} subagents (Haiku 5.5): searching and reading files, mapping a folder, editing, moving or creating files, running commands, fetching or scraping web pages, and any other well-defined day-to-day task. You cannot edit files yourself; keep for yourself only quick looks that cost less than a handoff.`,
+  `- You plan, explain and talk to the user. Do one-off operations yourself when a handoff would cost more: an API or MCP call (e.g. updating a merge request description, posting a note), a quick read or search. Hand runs of easy steps to ${CODER_TYPE} subagents (${label(CODER)}): reading or searching many files, mapping a folder, editing, moving or creating files, multi-step commands, scraping web pages. You cannot edit files yourself, and after ${MAX_DIRECT} tool calls in a row without a handoff your next calls are refused.`,
   `- Each executor prompt must be a handoff document with these headings, in order: ${HANDOFF.join(', ')}. Executors start with no context: put in it everything they need (absolute paths, URLs, snippets, conventions, the user's intent, what to report back). Under ## Files list the absolute path of every file it may change, or write "none" for read-only work (it then cannot edit).`,
   `- Split work into independent pieces and spawn one executor per piece, all in ONE message so they run in parallel. Usually that is 1 to 3; ${MAX_CODERS} is a hard cap, not a target. Executors that change files each get their own files (locked to that executor), and every executor gets its own ## Steps; overlapping files, repeated Steps or more than ${MAX_CODERS} running executors are refused.`,
-  `- When all executors of a batch have returned and any of them changed files, spawn exactly one ${REVIEWER_TYPE} (Sonnet 5.5) with a brief: the user's request, what you intended, what each executor reported, and what to test. The router attaches every handoff and diff. Sonnet tests, sends failures to fresh Haiku executors until they pass (up to ${MAX_FIXES}), and reports back to you; relay its outcome to the user. New executors are refused until the batch is reviewed; read-only batches need no review.`,
+  `- When all executors of a batch have returned and any of them changed files, spawn exactly one ${REVIEWER_TYPE} (${label(REVIEWER)}) with a brief: the user's request, what you intended, what each executor reported, and what to test. The router attaches every handoff and diff. Sonnet tests, sends failures to fresh Haiku executors until they pass (up to ${MAX_FIXES}), and reports back to you; relay its outcome to the user. New executors are refused until the batch is reviewed; read-only batches need no review.`,
   '- Executors and reviewers are single-use and pruned when done: you are the only stateful session. Never SendMessage a finished agent; spawn a fresh one with a new handoff document.',
 ].join('\n')
 
-const REVIEW_LOOP = [
+const reviewLoop = () => [
   'Your job, in order:',
   '1. Check every change above against its handoff and the brief. Run the relevant tests, or a one-off check when there are none.',
   `2. If something fails or is wrong, do not edit: spawn fresh ${CODER_TYPE} agents with handoff documents (${HANDOFF.join(', ')}; absolute paths under ## Files), one per independent file group, all in one message, then re-test. Repeat until everything passes, at most ${MAX_FIXES} fix executors in all.`,
@@ -52,6 +57,7 @@ const today = atom({ plugin: 'model-router', key: 'today' } as const, {})
 const lastReview = atom({ plugin: 'model-router', key: 'lastReview' } as const, '')
 const PANE = 'model-router'
 let isPaneShown = false // module state: a reload reopens the pane once
+let streak = 0 // main-chat tool calls since the last user prompt or handoff
 
 let ledger: Ledger = {}
 const files = new Map<string, Set<string>>() // running coder agentId -> files it edits
@@ -73,6 +79,11 @@ const partOf = (id: string): Part =>
 const modelOf = (id: string) => id.slice(id.indexOf(':') + 1).split('|')[0] ?? '' // 'part:model|sessionId' (old rows: 'part:model')
 const midnight = () => new Date().setHours(0, 0, 0, 0)
 const short = (model: string) => model.replace(/^claude-/, '').split('-')[0] ?? model
+// 'claude-<family>-<major>-<minor>' → '<Family> <major>.<minor>'; a trailing date ('-20251001') is dropped
+const label = (model: string) => {
+  const [family = '', ...ver] = model.replace(/^claude-/, '').replace(/-\d{8}$/, '').split('-')
+  return `${family.charAt(0).toUpperCase()}${family.slice(1)} ${ver.join('.')}`.trim()
+}
 const k = (n: number) =>
   n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${Math.round(n / 1000)}k` : String(Math.round(n))
 const base = (path: string) => path.slice(path.lastIndexOf('/') + 1)
@@ -159,6 +170,26 @@ async function dbGet($: EngineInterface, key: string) {
 }
 async function dbSet($: EngineInterface, key: string, value: unknown) {
   return $.fs.write(await dbPath($), JSON.stringify({ ...(await dbAll($)), [key]: value }))
+}
+
+// MODEL_ROUTER_* overrides: an unset or invalid value keeps its default.
+async function loadSettings($: EngineInterface) {
+  const str = (v: string | undefined, fallback: string) => v || fallback
+  const num = (v: string | undefined, fallback: number) => {
+    const n = Number(v)
+    return Number.isInteger(n) && n > 0 ? n : fallback
+  }
+  const effort = (v: string | undefined, fallback: string) => (v && /^(low|medium|high|xhigh|max)$/.test(v) ? v : fallback)
+  MAIN = str(await $.env.get('MODEL_ROUTER_MAIN_MODEL'), 'claude-opus-5-5')
+  MAIN_EFFORT = effort(await $.env.get('MODEL_ROUTER_MAIN_EFFORT'), 'high')
+  CODER = str(await $.env.get('MODEL_ROUTER_EXECUTOR_MODEL'), 'claude-haiku-5-5')
+  CODER_EFFORT = effort(await $.env.get('MODEL_ROUTER_EXECUTOR_EFFORT'), 'high')
+  REVIEWER = str(await $.env.get('MODEL_ROUTER_REVIEWER_MODEL'), 'claude-sonnet-5-5')
+  REVIEWER_EFFORT = effort(await $.env.get('MODEL_ROUTER_REVIEWER_EFFORT'), 'high')
+  MAX_CODERS = num(await $.env.get('MODEL_ROUTER_MAX_EXECUTORS'), 8)
+  MAX_FIXES = num(await $.env.get('MODEL_ROUTER_MAX_FIXES'), 5)
+  MAX_DIRECT = num(await $.env.get('MODEL_ROUTER_MAX_DIRECT'), 6)
+  MAX_CHARS = num(await $.env.get('MODEL_ROUTER_MAX_DIFF_CHARS'), 100_000)
 }
 
 type Plan = { at: number; rateLimits: SessionRateLimit[] }
@@ -323,20 +354,21 @@ async function card($: EngineInterface) {
     '',
     '| role | model |',
     '|---|---|',
-    '| main chat | Opus 5.5 · high |',
-    `| executors | Haiku 5.5 · ${list.length} running |`,
-    `| review | Sonnet 5.5${n > 0 ? ` · reviewing ${n}` : ''} |`,
+    `| main chat | ${label(MAIN)} · ${MAIN_EFFORT} |`,
+    `| executors | ${label(CODER)} · ${CODER_EFFORT} · ${list.length} running |`,
+    `| review | ${label(REVIEWER)} · ${REVIEWER_EFFORT}${n > 0 ? ` · reviewing ${n}` : ''} |`,
     '',
     `**Plan (all devices):** ${plan}`,
     '',
     `**Today:** ${usage}`,
-    ...list.map(run => `- haiku ▸ ${run.task}${run.files.length > 0 ? ` (${run.files.map(base).join(', ')})` : ''}`),
+    ...list.map(run => `- ${short(CODER)} ▸ ${run.task}${run.files.length > 0 ? ` (${run.files.map(base).join(', ')})` : ''}`),
     ...(last !== '' ? ['', `**Last review:** ${last}`] : []),
   ].join('\n')
 }
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
+    await loadSettings($)
     // one-time move of this copy's old $.store data into the shared file
     for (const key of ['usage', 'since', 'plan', 'spent', 'calibration'])
       if ((await dbGet($, key)) === undefined) {
@@ -350,21 +382,20 @@ export const register: Register = on => {
     await update($, today, () => totals())
     await $.agent.register({
       name: 'executor',
-      description: `Haiku 5.5 executor: carries out any well-defined operation Opus hands off (search and read files, map folders, edit, move or create files, run commands, fetch or scrape web pages) and reports back. The prompt must be a handoff document (${HANDOFF.join(', ')}); its Files section lists the absolute paths it may change, or "none" for read-only work. Spawn several in one message to run in parallel.`,
+      description: `${label(CODER)} executor: carries out any well-defined operation Opus hands off (search and read files, map folders, edit, move or create files, run commands, fetch or scrape web pages) and reports back. The prompt must be a handoff document (${HANDOFF.join(', ')}); its Files section lists the absolute paths it may change, or "none" for read-only work. Spawn several in one message to run in parallel.`,
       prompt:
         'You are an executor. You get a handoff document (Goal, Context, Files, Steps, Done when) and carry out the Steps, using your own judgment for small details the Steps leave open. Change only the files listed under Files (if it says none, change nothing): other executors may be working in parallel. For edits, make the smallest diff that works and match the surrounding style. Finish with a short report: what you did, what you found (the facts asked for, with paths or URLs), the files you changed, and anything you could not do.',
       model: CODER,
-      effort: 'high',
+      effort: CODER_EFFORT as never,
       disallowedTools: ['Agent'],
     })
     await $.agent.register({
       name: 'reviewer',
-      description:
-        'Sonnet 5.5 batch reviewer: spawn exactly one after all executors of a batch have returned, with a brief (request, intent, executor reports, what to test). It tests, sends failures to fresh Haiku executors until they pass, and reports back.',
+      description: `${label(REVIEWER)} batch reviewer: spawn exactly one after all executors of a batch have returned, with a brief (request, intent, executor reports, what to test). It tests, sends failures to fresh Haiku executors until they pass, and reports back.`,
       prompt:
         'You review and test one batch of changes that Haiku executors made from handoff documents Opus wrote. You never edit files: every fix goes to a fresh model-router:executor with a handoff document. Follow the steps at the end of your prompt.',
       model: REVIEWER,
-      effort: 'high',
+      effort: REVIEWER_EFFORT as never,
       disallowedTools: ['Edit', 'Write', 'NotebookEdit'],
     })
     await $.command.register({
@@ -379,6 +410,7 @@ export const register: Register = on => {
 
   // A prompt counts as asked, so the pane is placed at any width (VS Code's narrow panel included).
   on('prompt.submit', async ($, e, next) => {
+    streak = 0
     if (!isPaneShown) isPaneShown = (await $.ui.open({ id: PANE, title: 'Model router' })).isPlaced
     return next(e)
   })
@@ -386,8 +418,8 @@ export const register: Register = on => {
   // Opus learns the protocol from its system prompt.
   on('prompt.compose', async ($, e, next) => {
     const r = await next(e)
-    if (e.model.includes('haiku')) return r
-    return { sections: [...r.sections, { id: 'model-router:protocol', text: PROTOCOL, scope: 'session' as const }] }
+    if (e.model === CODER) return r
+    return { sections: [...r.sections, { id: 'model-router:protocol', text: protocol(), scope: 'session' as const }] }
   })
 
   // Only Opus keeps state: subagents are single-use, so they are never compacted (one that overflows ends and Opus re-delegates).
@@ -395,10 +427,10 @@ export const register: Register = on => {
     e.agentId ? { skip: 'model-router: subagents are single-use and are not compacted.' } : next(e),
   )
 
-  // Router: main chat, coders and reviewers all at high effort (the session's effort setting does not apply); every request is metered by part.
+  // Router: main chat, coders and reviewers run at their configured effort (the session's effort setting does not apply to them); every request is metered by part.
   on('turn.step', async function* ($, e, next) {
-    const effort = !e.agentId || files.has(e.agentId) || reviewers.has(e.agentId) ? 'high' : e.effort
-    const r = yield* next(!e.agentId ? { ...e, model: MAIN, effort: 'high' } : { ...e, effort })
+    const effort = (!e.agentId ? MAIN_EFFORT : files.has(e.agentId) ? CODER_EFFORT : reviewers.has(e.agentId) ? REVIEWER_EFFORT : e.effort) as never
+    const r = yield* next(!e.agentId ? { ...e, model: MAIN, effort } : { ...e, effort })
     const part: Part = !e.agentId ? 'chat' : files.has(e.agentId) ? 'coder' : reviewers.has(e.agentId) ? 'review' : 'subagent'
     if (r.usage) await meter($, part, r.usage.model, fromUsage(r.usage))
     return r
@@ -429,6 +461,12 @@ export const register: Register = on => {
 
   // Only running coders edit, and each file belongs to one coder at a time.
   on('tool.call', async ($, e, next) => {
+    // Opus may make one-off calls itself; a run of easy steps goes to an executor.
+    if (!e.agentId) {
+      if (e.tool === 'Agent') streak = 0
+      else if (++streak > MAX_DIRECT)
+        return { deny: `model-router: ${MAX_DIRECT} tool calls in a row. Hand the remaining steps to ${CODER_TYPE} in one handoff document.` }
+    }
     if (!EDIT_TOOLS.includes(String(e.tool))) return next(e)
     const mine = files.get(e.agentId ?? '')
     if (!mine) return { deny: `model-router: file edits are routed. Delegate this change to ${CODER_TYPE} with a handoff document.` }
@@ -493,7 +531,7 @@ export const register: Register = on => {
       )
       await meter($, 'handoff', MAIN, { calls: 1, input: 0, output: Math.round(e.prompt.length / 4), cacheRead: 0, cacheWrite: 0 })
       await update($, lastReview, () => `started ${new Date().toTimeString().slice(0, 5)} for ${done.length} change${done.length === 1 ? '' : 's'}`)
-      return next({ ...e, prompt: [`Brief from Opus:\n${e.prompt}`, ...changes, REVIEW_LOOP].join('\n\n') })
+      return next({ ...e, prompt: [`Brief from Opus:\n${e.prompt}`, ...changes, reviewLoop()].join('\n\n') })
     }
     if (e.subagent_type !== CODER_TYPE) return next(e)
     if (!caller && batch.length > 0 && declared.size === 0)
@@ -541,13 +579,13 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column">
         <Text bold color="green">● model-router active</Text>
-        <Text>main chat  Opus 5.5 · high</Text>
-        <Text>executors Haiku 5.5 · {list.length} running</Text>
-        <Text>review     Sonnet 5.5{n > 0 ? ` · reviewing ${n}` : ''}</Text>
+        <Text>main chat  {label(MAIN)} · {MAIN_EFFORT}</Text>
+        <Text>executors {label(CODER)} · {CODER_EFFORT} · {list.length} running</Text>
+        <Text>review     {label(REVIEWER)} · {REVIEWER_EFFORT}{n > 0 ? ` · reviewing ${n}` : ''}</Text>
         <Text dimColor>today      {usage.map(([m, v]) => `${m} ${k(v)}`).join(' · ') || 'no usage yet'}</Text>
         {list.map(run => (
           <Text color="cyan">
-            haiku ▸ {run.task}
+            {short(CODER)} ▸ {run.task}
             {run.files.length > 0 ? ` (${run.files.map(base).join(', ')})` : ''}
           </Text>
         ))}
@@ -560,7 +598,7 @@ export const register: Register = on => {
   on('ui.render', { component: 'ToolUse', props: { tool: 'Agent' } }, ($, e, next) => {
     const input = e.props.input as { subagent_type?: string; description?: string }
     if (input.subagent_type !== CODER_TYPE) return next(e)
-    return next({ ...e, props: { ...e.props, input: { ...input, description: `Haiku 5.5 · ${input.description ?? ''}` } } })
+    return next({ ...e, props: { ...e.props, input: { ...input, description: `${label(CODER)} · ${input.description ?? ''}` } } })
   })
 
   on('command.run', { command: 'router' }, async $ => {

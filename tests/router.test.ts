@@ -188,3 +188,41 @@ test('reviewer needs a finished batch of coder changes', async $ => {
   const r = await $.tool.call({ tool: 'Agent', subagent_type: 'model-router:reviewer', description: 'review', prompt: 'brief' } as never)
   expect(JSON.stringify(r)).toContain('nothing to review')
 })
+
+test('main chat may make a few direct calls, then must hand off', async ($, on) => {
+  on('tool.call', () => ({ result: 'ran' }) as never)
+  for (let i = 0; i < 6; i++) expect((await $.tool.call({ tool: 'mcp__GitLab__save_merge_request' } as never)).deny).toBeUndefined()
+  expect((await $.tool.call({ tool: 'Read', file_path: '/tmp/a' } as never)).deny).toContain('model-router:executor')
+})
+
+// Last test: the overrides it sets stay in the module for the rest of this file.
+test('MODEL_ROUTER_* env vars override the settings at session start', async ($, on) => {
+  const env: Record<string, string> = { HOME: '/home/test', MODEL_ROUTER_EXECUTOR_MODEL: 'claude-sonnet-5-5', MODEL_ROUTER_MAX_DIRECT: '2' }
+  let spawned = ''
+  on('env.get', (_$, e) => ({ value: env[e.name] }) as never)
+  on('session.start', (_$, e) => ({ cwd: e.cwd, value: undefined }) as never)
+  on('prompt.submit', () => ({ text: 'go' }) as never)
+  on('agent.register', () => ({ value: undefined }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('ui.open', () => ({ value: { isPlaced: false } }) as never)
+  on('session.id', () => ({ value: 'chat-1' }) as never)
+  on('session.usage', () => ({ value: { startedAt: 0, rateLimits: [] } }) as never)
+  on('store.get', () => ({ value: undefined }) as never)
+  on('store.set', () => ({ value: undefined }) as never)
+  on('fs.read', () => ({ value: '{}' }) as never)
+  on('fs.write', () => ({ value: undefined }) as never)
+  on('tool.call', () => ({ result: 'ran' }) as never)
+  on('agent.spawn', (_$, e) => {
+    spawned = e.model ?? ''
+    return { model: e.model ?? '', agentId: 'coder-env' }
+  })
+  await $.session.start({ cwd: '/tmp' } as never)
+  await $.prompt.submit({ text: 'go' } as never)
+  await $.agent.spawn({ subagentType: 'model-router:executor', prompt: HANDOFF, description: 'x', tool_use_id: 't-env' } as never)
+  expect(spawned).toBe('claude-sonnet-5-5')
+  const call = () => $.tool.call({ tool: 'mcp__GitLab__save_merge_request' } as never)
+  expect((await call()).deny).toBeUndefined()
+  expect((await call()).deny).toBeUndefined()
+  expect((await call()).deny).toContain('2 tool calls')
+})

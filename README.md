@@ -112,7 +112,7 @@ For readers who want to know exactly what the plugin does. It is a Claude Code p
 | Review | Sonnet 5.5, high effort | once every executor of a batch has returned, Opus spawns one `model-router:reviewer` with a brief (request, intent, executor reports, what to test) and the router attaches every handoff and diff; Sonnet runs the tests or a one-off check, sends each failure to fresh Haiku fix executors (up to 5 per review), re-tests until everything passes and reports to Opus; it never edits, new executors are refused until the batch is reviewed, and read-only batches need no review |
 | Single-use agents | Haiku 5.5, Sonnet 5.5 | executors and the reviewer are fresh sessions, pruned when done: SendMessage to them is refused and they are never compacted; Opus is the only stateful session and the only one auto-compacted |
 
-Effort is set on every request: Opus, Sonnet and Haiku all run at high. Your session's effort setting does not change it.
+Effort is set on every request: by default Opus, Sonnet and Haiku all run at high (see [Configure](#configure) to change it). Your session's effort setting does not change it.
 
 ### Flow
 
@@ -197,7 +197,30 @@ Do not combine an install with `--plugin-dir` or `CLAUDE_CODE_PLUGIN_DIRS` on th
 
 ### Configure
 
-The models are constants at the top of `hooks/register.tsx`: `MAIN` (Opus), `CODER` (the Haiku executors) and `REVIEWER` (Sonnet). Change them, then update the plugin.
+The router reads these environment variables once, when a session starts.
+
+| Variable | Default | What it sets |
+|---|---|---|
+| `MODEL_ROUTER_MAIN_MODEL` | `claude-opus-5-5` | model of the main chat |
+| `MODEL_ROUTER_MAIN_EFFORT` | `high` | effort of the main chat |
+| `MODEL_ROUTER_EXECUTOR_MODEL` | `claude-haiku-5-5` | model of the executors |
+| `MODEL_ROUTER_EXECUTOR_EFFORT` | `high` | effort of the executors |
+| `MODEL_ROUTER_REVIEWER_MODEL` | `claude-sonnet-5-5` | model of the batch reviewer |
+| `MODEL_ROUTER_REVIEWER_EFFORT` | `high` | effort of the reviewer |
+| `MODEL_ROUTER_MAX_EXECUTORS` | `8` | executors running at once |
+| `MODEL_ROUTER_MAX_FIXES` | `5` | fix executors one review may spawn |
+| `MODEL_ROUTER_MAX_DIRECT` | `6` | tool calls the main chat may make in a row before it must hand off |
+| `MODEL_ROUTER_MAX_DIFF_CHARS` | `100000` | characters of handoffs and diffs attached to the reviewer brief |
+
+An effort must be `low`, `medium`, `high`, `xhigh` or `max`, and a number must be a positive integer. Any other value falls back to the default.
+
+Set them in the `"env"` object of `~/.claude/settings.json` or the project's `.claude/settings.json`, or export them in the shell before you start `claude`:
+
+```json
+{ "env": { "MODEL_ROUTER_EXECUTOR_EFFORT": "medium", "MODEL_ROUTER_MAX_DIRECT": "10" } }
+```
+
+A change needs a new session.
 
 ### Known limits
 
