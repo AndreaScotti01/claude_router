@@ -226,3 +226,31 @@ test('MODEL_ROUTER_* env vars override the settings at session start', async ($,
   expect((await call()).deny).toBeUndefined()
   expect((await call()).deny).toContain('2 tool calls')
 })
+
+test('MODEL_ROUTER_* env vars are re-read on every prompt', async ($, on) => {
+  const env: Record<string, string> = { HOME: '/home/test' }
+  let spawned = ''
+  on('env.get', (_$, e) => ({ value: env[e.name] }) as never)
+  on('session.start', (_$, e) => ({ cwd: e.cwd, value: undefined }) as never)
+  on('prompt.submit', () => ({ text: 'go' }) as never)
+  on('agent.register', () => ({ value: undefined }) as never)
+  on('command.register', () => ({ value: undefined }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('ui.open', () => ({ value: { isPlaced: false } }) as never)
+  on('session.id', () => ({ value: 'chat-2' }) as never)
+  on('session.usage', () => ({ value: { startedAt: 0, rateLimits: [] } }) as never)
+  on('store.get', () => ({ value: undefined }) as never)
+  on('store.set', () => ({ value: undefined }) as never)
+  on('fs.read', () => ({ value: '{}' }) as never)
+  on('fs.write', () => ({ value: undefined }) as never)
+  on('tool.call', () => ({ result: 'ran' }) as never)
+  on('agent.spawn', (_$, e) => {
+    spawned = e.model ?? ''
+    return { model: e.model ?? '', agentId: 'coder-reload' }
+  })
+  await $.session.start({ cwd: '/tmp' } as never)
+  env.MODEL_ROUTER_EXECUTOR_MODEL = 'claude-sonnet-5-5'
+  await $.prompt.submit({ text: 'go' } as never)
+  await $.agent.spawn({ subagentType: 'model-router:executor', prompt: HANDOFF, description: 'x', tool_use_id: 't-reload' } as never)
+  expect(spawned).toBe('claude-sonnet-5-5')
+})

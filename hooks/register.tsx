@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ModelUsage, Register, SessionMessage, SessionRateLimit } from 'claude-code'
 
-// Defaults; each can be overridden by a MODEL_ROUTER_* env var (README.md › Configure), read at session start.
+// Defaults; each can be overridden by a MODEL_ROUTER_* env var (README.md › Configure), read at session start and on every prompt.
 let MAIN = 'claude-opus-5-5'
 let MAIN_EFFORT = 'high'
 let CODER = 'claude-haiku-5-5'
@@ -408,8 +408,9 @@ export const register: Register = on => {
     return next(e)
   })
 
-  // A prompt counts as asked, so the pane is placed at any width (VS Code's narrow panel included).
+  // A prompt counts as asked, so the pane is placed at any width (VS Code's narrow panel included); re-reads MODEL_ROUTER_* so /reload-plugins applies changes.
   on('prompt.submit', async ($, e, next) => {
+    await loadSettings($)
     streak = 0
     if (!isPaneShown) isPaneShown = (await $.ui.open({ id: PANE, title: 'Model router' })).isPlaced
     return next(e)

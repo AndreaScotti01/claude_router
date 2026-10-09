@@ -197,7 +197,7 @@ Do not combine an install with `--plugin-dir` or `CLAUDE_CODE_PLUGIN_DIRS` on th
 
 ### Configure
 
-The router reads these environment variables once, when a session starts.
+The router reads these environment variables when a session starts and on every prompt.
 
 | Variable | Default | What it sets |
 |---|---|---|
@@ -220,7 +220,7 @@ Set them in the `"env"` object of `~/.claude/settings.json` or the project's `.c
 { "env": { "MODEL_ROUTER_EXECUTOR_EFFORT": "medium", "MODEL_ROUTER_MAX_DIRECT": "10" } }
 ```
 
-A change needs a new session.
+A change applies after `/reload-plugins` or in a new session.
 
 ### Known limits
 
