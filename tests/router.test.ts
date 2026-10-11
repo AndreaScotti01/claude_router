@@ -319,6 +319,28 @@ test('tier agents get the session-start knowledge base, and later changes only w
   expect(sent.prompt).toContain("## User's message (verbatim)\ngo\n\n## Knowledge base updates (newer than your system prompt)\nkb text 2")
 })
 
+test('a knowledge-base reply that hit the token cap is not written', async ($, on) => {
+  const written: string[] = []
+  on('env.get', (_$, e) => ({ value: e.name === 'HOME' ? '/home/test' : undefined }) as never)
+  on('session.id', () => ({ value: 'chat-cap' }) as never)
+  on('session.usage', () => ({ value: { startedAt: 0, rateLimits: [] } }) as never)
+  on('model.complete', () =>
+    ({ value: { isAnswered: true, text: '- (repo) fact', usage: { input_tokens: 10, output_tokens: 16000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }) as never,
+  )
+  on('ui.open', () => ({ value: { isPlaced: false } }) as never)
+  on('ui.status', () => ({ value: undefined }) as never)
+  on('fs.read', (_$, e) => ({ value: e.path.endsWith('router-kb.md') ? 'kb text' : '{}' }) as never)
+  on('fs.write', (_$, e: { path: string; text: string }) => {
+    if (e.path.endsWith('router-kb.md')) written.push(e.text)
+    return { value: undefined } as never
+  })
+  on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false } }) as never)
+  on('turn.complete', () => ({ text: '' }) as never)
+  await $.turn.complete({ answer: 'done', reason: 'answer', turnId: 't', durationMs: 1, isAborted: false } as never)
+  await new Promise(r => setTimeout(r, 20))
+  expect(written).toHaveLength(0)
+})
+
 test('session end waits for a pending knowledge-base update', async ($, on) => {
   const written: string[] = []
   let release = () => {}

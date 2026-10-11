@@ -10,7 +10,9 @@ let COMPLEX = 'claude-opus-5-5'
 let COMPLEX_EFFORT = 'high'
 let CLASSIFIER = 'claude-haiku-5-5'
 let CLASSIFIER_EFFORT = 'low'
+let KB_EFFORT = 'high'
 let KB_CHARS = 8000 // knowledge base characters sent to the main chat and to each agent
+const KB_MAX_TOKENS = 16_000 // output tokens for the updater, thinking included: a reply that reaches it was cut off
 let ANALYTICS = 'off' // SQLite file every router event is appended to (README.md › Analytics); 'off' disables it
 const MEDIUM_TYPE = 'model-router:sonnet'
 const COMPLEX_TYPE = 'model-router:opus'
@@ -194,9 +196,9 @@ async function updateKb($: EngineInterface, user: string, answer: string, notes:
   const r = await $.model
     .complete({
       model: SIMPLE,
-      effort: 'low' as never,
-      maxTokens: 4096,
-      timeoutMs: 60_000,
+      effort: KB_EFFORT as never,
+      maxTokens: KB_MAX_TOKENS,
+      timeoutMs: 120_000,
       system: KB_RULES(),
       prompt: [
         { text: `Knowledge base now (${body.length} of ${KB_CHARS} characters):\n${body || '(empty)'}`, cache: true },
@@ -205,6 +207,7 @@ async function updateKb($: EngineInterface, user: string, answer: string, notes:
     })
     .catch(() => undefined)
   if (r?.usage) await meter($, 'kb', SIMPLE, fromUsage(r.usage))
+  if (r?.isAnswered && r.usage.output_tokens >= KB_MAX_TOKENS) return // a reply that hit the cap is cut off: never write a partial knowledge base
   const out = r?.isAnswered ? r.text.trim() : ''
   if (out === '' || out === 'NONE') return
   const next = out
@@ -304,6 +307,7 @@ async function loadSettings($: EngineInterface) {
   COMPLEX_EFFORT = effort(await $.env.get('MODEL_ROUTER_COMPLEX_EFFORT'), 'high')
   CLASSIFIER = str(await $.env.get('MODEL_ROUTER_CLASSIFIER_MODEL'), 'claude-haiku-5-5')
   CLASSIFIER_EFFORT = effort(await $.env.get('MODEL_ROUTER_CLASSIFIER_EFFORT'), 'low')
+  KB_EFFORT = effort(await $.env.get('MODEL_ROUTER_KB_EFFORT'), 'high')
   KB_CHARS = num(await $.env.get('MODEL_ROUTER_KB_CHARS'), 8000)
   STYLE = (await $.env.get('MODEL_ROUTER_STYLE')) === 'off' ? 'off' : 'adhd'
   const home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? '.'
@@ -550,7 +554,7 @@ export const register: Register = on => {
     record($, 'route', { model: CLASSIFIER, detail: { tier, forced: Boolean(forced) } })
     await update($, route, () => `${tier}${forced ? ' (forced)' : ''} · ${new Date().toTimeString().slice(0, 5)}`)
     record($, 'prompt', {
-      detail: { settings: { SIMPLE, SIMPLE_EFFORT, MEDIUM, MEDIUM_EFFORT, COMPLEX, COMPLEX_EFFORT, CLASSIFIER, CLASSIFIER_EFFORT, KB_CHARS, STYLE } },
+      detail: { settings: { SIMPLE, SIMPLE_EFFORT, MEDIUM, MEDIUM_EFFORT, COMPLEX, COMPLEX_EFFORT, CLASSIFIER, CLASSIFIER_EFFORT, KB_EFFORT, KB_CHARS, STYLE } },
     })
     const note =
       tier === 'simple'

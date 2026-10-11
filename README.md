@@ -129,7 +129,7 @@ For readers who want to know exactly what the plugin does. It is a Claude Code p
 |---|---|---|
 | Front desk | Haiku 5.5, high effort | every main-chat model request is rewritten to the simple model and effort; a system-prompt section teaches the protocol, carries a snapshot of the knowledge base taken at session start, and sets the ADHD-friendly output style (next action first, numbered steps, at most 5 items per list, one concrete next action at the end); agent reports come in a shape the front desk can relay without pasting them whole |
 | Classifier | Haiku 5.5, low effort | one hardcoded call per user message, seeing the message and the last assistant reply; it answers simple, medium or complex. Unsure means the higher tier; a failed call means medium; a leading `!haiku`, `!sonnet` or `!opus` skips the call and forces the tier |
-| Knowledge updater | Haiku 5.5, low effort | one call after each main-chat turn, in the background; sees the knowledge base and that turn (your message, the final answer, the agents' reports) and returns the updated list or NONE |
+| Knowledge updater | Haiku 5.5, high effort | one call after each main-chat turn, in the background; sees the knowledge base and that turn (your message, the final answer, the agents' reports) and returns the updated list or NONE |
 | Simple | Haiku 5.5, high effort | the front desk does the work itself |
 | Medium | Sonnet 5.5, high effort | the main chat may only spawn fresh `model-router:sonnet` agents; every other tool call is refused for that message |
 | Complex | Opus 5.5, high effort | the main chat may only spawn `model-router:opus` agents; every other tool call is refused for that message |
@@ -138,7 +138,7 @@ For readers who want to know exactly what the plugin does. It is a Claude Code p
 | Knowledge base | all | `.claude/router-kb.md`, read by the front desk and each agent at session start (the agents also get the current version in their handoff when it changed), written only by the knowledge updater |
 | Single-use agents | Sonnet 5.5, Opus 5.5 | fresh sessions: SendMessage to them is refused and they are never compacted |
 
-Effort is set on every request: by default the front desk, Sonnet and Opus run at high, and the classifier and the updater at low (see [Configure](#configure) to change it). Your session's effort setting does not change it. The output style is adapted from [i-have-adhd](https://github.com/ayghri/i-have-adhd) (MIT).
+Effort is set on every request: by default the front desk, Sonnet and Opus run at high, the classifier at low and the updater at high (see [Configure](#configure) to change it). Your session's effort setting does not change it. The output style is adapted from [i-have-adhd](https://github.com/ayghri/i-have-adhd) (MIT).
 
 ### Flow
 
@@ -153,7 +153,7 @@ flowchart TD
     F -->|answer| U
     KB[("router-kb.md")] -.->|"snapshot at session start"| F
     KB -.->|"snapshot at session start, changes in handoff"| A
-    F & A -.->|"turn and ## Facts reports"| T["Knowledge updater · Haiku 5.5 · low effort<br/>after each turn"]
+    F & A -.->|"turn and ## Facts reports"| T["Knowledge updater · Haiku 5.5 · high effort<br/>after each turn"]
     T -.->|"rewrites, marks stale"| KB
     K & F & A & T -.->|tokens| M[("meter: per hour, per part, per chat")]
     M -.-> S["/router-usage · reset · /router card"]
@@ -174,7 +174,7 @@ Headings count only at the start of a line, so a handoff can mention them in its
 
 - **Where it lives.** `.claude/router-kb.md` in the project folder. Its first line is `<!-- model-router knowledge base · checked at <git commit> -->`. Below it, one fact per bullet, `- (relative/path) fact`, kept under `MODEL_ROUTER_KB_CHARS` (8000 by default).
 - **Who reads it.** The front desk gets a snapshot in its system prompt at session start. Each Sonnet or Opus agent gets a snapshot in its system prompt at session start. If the file changed since then, the current version is also appended to the agent's handoff under "Knowledge base updates".
-- **Who writes it.** Only the knowledge updater. After every main-chat turn, a Haiku 5.5 call (low effort, in the background) reads the file plus that turn: your message, the final answer, and the agents' reports, which end with a `## Facts` section. It returns the updated list or `NONE`. Its rules:
+- **Who writes it.** Only the knowledge updater. After every main-chat turn, a Haiku 5.5 call (high effort, in the background) reads the file plus that turn: your message, the final answer, and the agents' reports, which end with a `## Facts` section. It returns the updated list or `NONE`. Its rules:
   - one fact per bullet, and only durable ones: what files do, conventions, decisions and why, gotchas, working commands. Never task status;
   - keep existing bullets unless a turn contradicts or duplicates them;
   - over the limit, merge and drop the least useful bullets instead of cutting off the end;
@@ -307,6 +307,7 @@ The router reads these environment variables when a session starts and on every 
 | `MODEL_ROUTER_COMPLEX_EFFORT` | `high` | effort of the complex agents |
 | `MODEL_ROUTER_CLASSIFIER_MODEL` | `claude-haiku-5-5` | model that picks the tier |
 | `MODEL_ROUTER_CLASSIFIER_EFFORT` | `low` | effort of the classifier |
+| `MODEL_ROUTER_KB_EFFORT` | `high` | effort of the knowledge updater |
 | `MODEL_ROUTER_KB_CHARS` | `8000` | characters of the knowledge base sent to models; also the size the updater keeps the file under |
 | `MODEL_ROUTER_STYLE` | `adhd` | how the front desk writes to you; `off` for Claude's default style |
 | `MODEL_ROUTER_ANALYTICS_DB` | `~/.claude/model-router-analytics.db` | SQLite file every router event is appended to; `off` disables it |
