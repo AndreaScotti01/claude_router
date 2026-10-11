@@ -1,7 +1,7 @@
-export type CoderRun = { id: string; task: string; files: string[] }
+export type AgentRun = { id: string; task: string; tier: string }
 
 declare module 'claude-code' {
   interface PluginState {
-    'model-router': { runs: CoderRun[]; reviewing: number; today: Record<string, number>; lastReview: string }
+    'model-router': { runs: AgentRun[]; today: Record<string, number>; route: string }
   }
 }
