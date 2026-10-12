@@ -2,25 +2,28 @@ import { expect, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 const HANDOFF = '## Goal\ng\n\n## Context\nc\n\n## Scope\ns\n\n## Done when\nd'
-const ANSWER = (text: string) =>
-  ({ value: { isAnswered: true, text, usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }) as never
 const NO_ANSWER = { value: { isAnswered: false, reason: 'empty-reply' } } as never
 
-// Stubs every engine call a prompt makes; `classify` answers the classifier, the knowledge base reads as 'kb text'.
-function stub(on: On, classify: () => unknown, env: Record<string, string> = {}) {
+// Stubs the engine calls metering and analytics make (not the files, so a test can supply its own knowledge base).
+function engine(on: On, env: Record<string, string> = {}) {
   on('env.get', (_$, e) => ({ value: env[e.name] ?? (e.name === 'HOME' ? '/home/test' : undefined) }) as never)
   on('session.id', () => ({ value: 'chat-t' }) as never)
   on('session.messages', () => ({ value: [] }) as never)
   on('session.usage', () => ({ value: { startedAt: 0, rateLimits: [] } }) as never)
-  on('model.complete', () => classify() as never)
   on('ui.open', () => ({ value: { isPlaced: false } }) as never)
   on('ui.status', () => ({ value: undefined }) as never)
+  on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false } }) as never)
+}
+
+// Stubs every engine call a prompt makes; the knowledge base reads as 'kb text'.
+function stub(on: On, env: Record<string, string> = {}) {
+  engine(on, env)
   on('fs.read', (_$, e) => ({ value: e.path.endsWith('router-kb.md') ? 'kb text' : '{}' }) as never)
   on('fs.write', () => ({ value: undefined }) as never)
   on('prompt.submit', (_$, e) => ({ text: e.text }) as never)
 }
 
-test('the main chat runs on Haiku', async ($, on) => {
+test('the main chat runs on Sonnet whatever model the session names', async ($, on) => {
   let model = ''
   on('turn.step', async function* (_$, e) {
     model = e.model
@@ -29,72 +32,74 @@ test('the main chat runs on Haiku', async ($, on) => {
   for await (const _ of $.turn.step({ turnId: 't', index: 0, model: 'claude-opus-5-5', messageCount: 0 } as never)) {
     // drain the stream
   }
-  expect(model).toBe('claude-haiku-5-5')
+  expect(model).toBe('claude-sonnet-5-5')
 })
 
-test('a complex message: the main chat may only spawn model-router:opus with a handoff', async ($, on) => {
-  stub(on, () => ANSWER('complex'))
+test('no message is classified: the main chat keeps all its tools', async ($, on) => {
+  let calls = 0
+  stub(on)
+  on('model.complete', () => {
+    calls++
+    return NO_ANSWER
+  })
+  on('tool.call', () => ({ result: 'ok' }) as never)
+  await $.prompt.submit({ text: 'Refactor the auth module' } as never)
+  expect(calls).toBe(0)
+  for (const tool of ['Read', 'Edit', 'Bash']) expect((await $.tool.call({ tool, file_path: '/tmp/a' } as never)).deny).toBeUndefined()
+})
+
+test('worker and advisor agents need a handoff and get the user message verbatim', async ($, on) => {
+  stub(on)
   let sent: { prompt?: string } = {}
   on('tool.call', (_$, e) => {
     sent = e as never
     return { result: 'ok' } as never
   })
   await $.prompt.submit({ text: 'Refactor the auth module\n  keep  spacing' } as never)
-  expect((await $.tool.call({ tool: 'Read', file_path: '/tmp/a' } as never)).deny).toContain('routed to complex')
-  const ok = await $.tool.call({ tool: 'Agent', subagent_type: 'model-router:opus', description: 'auth', prompt: HANDOFF } as never)
-  expect(ok.deny).toBeUndefined()
-  expect(sent.prompt).toContain("## User's message (verbatim)\nRefactor the auth module\n  keep  spacing")
-  const bare = await $.tool.call({ tool: 'Agent', subagent_type: 'model-router:opus', description: 'x', prompt: 'just do it' } as never)
-  expect(bare.deny).toContain('## Done when')
+  for (const subagent_type of ['model-router:haiku', 'model-router:opus']) {
+    const ok = await $.tool.call({ tool: 'Agent', subagent_type, description: 'auth', prompt: HANDOFF } as never)
+    expect(ok.deny).toBeUndefined()
+    expect(sent.prompt).toContain("## User's message (verbatim)\nRefactor the auth module\n  keep  spacing")
+    const bare = await $.tool.call({ tool: 'Agent', subagent_type, description: 'x', prompt: 'just do it' } as never)
+    expect(bare.deny).toContain('## Done when')
+  }
 })
 
-test('!sonnet routes to medium without the classifier', async ($, on) => {
-  let calls = 0
-  let sent: { prompt?: string } = {}
-  stub(on, () => {
-    calls++
-    return ANSWER('complex')
-  })
-  on('tool.call', (_$, e) => {
-    sent = e as never
-    return { result: 'ok' } as never
-  })
-  await $.prompt.submit({ text: '!sonnet fix the typo' } as never)
-  expect(calls).toBe(0)
-  expect((await $.tool.call({ tool: 'Agent', subagent_type: 'model-router:opus', description: 'x', prompt: HANDOFF } as never)).deny).toContain('routed to medium')
-  const ok = await $.tool.call({ tool: 'Agent', subagent_type: 'model-router:sonnet', description: 'x', prompt: HANDOFF } as never)
-  expect(ok.deny).toBeUndefined()
-  expect(sent.prompt).toContain("## User's message (verbatim)\nfix the typo")
-})
-
-test('a failed classification routes to medium', async ($, on) => {
-  stub(on, () => NO_ANSWER)
-  on('tool.call', () => ({ result: 'ok' }) as never)
-  await $.prompt.submit({ text: 'do it' } as never)
-  expect((await $.tool.call({ tool: 'Read', file_path: '/tmp/a' } as never)).deny).toContain('routed to medium')
-})
-
-test('model-router:sonnet runs on Sonnet in the foreground', async ($, on) => {
-  let seen: { model?: string; background?: boolean } = {}
+test('model-router:haiku runs on Haiku and model-router:opus on Opus, in the foreground', async ($, on) => {
+  const seen: { model?: string; background?: boolean }[] = []
   on('agent.spawn', (_$, e) => {
-    seen = { model: e.model, background: e.background }
-    return { model: e.model ?? '', agentId: 'sonnet-1' }
+    seen.push({ model: e.model, background: e.background })
+    return { model: e.model ?? '', agentId: `a-${seen.length}` }
   })
-  await $.agent.spawn({ subagentType: 'model-router:sonnet', prompt: HANDOFF, description: 'x', tool_use_id: 't-s' } as never)
-  expect(seen).toEqual({ model: 'claude-sonnet-5-5', background: false })
+  await $.agent.spawn({ subagentType: 'model-router:haiku', prompt: HANDOFF, description: 'x', tool_use_id: 't-h' } as never)
+  await $.agent.spawn({ subagentType: 'model-router:opus', prompt: HANDOFF, description: 'x', tool_use_id: 't-o' } as never)
+  expect(seen).toEqual([
+    { model: 'claude-haiku-5-5', background: false },
+    { model: 'claude-opus-5-5', background: false },
+  ])
 })
 
-test('a simple message lets the main chat edit', async ($, on) => {
-  stub(on, () => ANSWER('simple'))
-  on('tool.call', () => ({ result: 'edited' }) as never)
-  await $.prompt.submit({ text: 'rename x' } as never)
-  const edit = await $.tool.call({ tool: 'Edit', file_path: '/r/a.py', old_string: 'a', new_string: 'b' } as never)
-  expect(edit.deny).toBeUndefined()
+test('the advisor and the worker are registered read-only', async ($, on) => {
+  const registered: Record<string, { disallowedTools?: string[]; model?: string }> = {}
+  stub(on)
+  on('session.start', (_$, e) => ({ cwd: e.cwd, value: undefined }) as never)
+  on('agent.register', (_$, e) => {
+    registered[String(e.name)] = e as never
+    return { value: undefined } as never
+  })
+  on('command.register', () => ({ value: undefined }) as never)
+  on('store.get', () => ({ value: undefined }) as never)
+  on('store.set', () => ({ value: undefined }) as never)
+  await $.session.start({ cwd: '/tmp' } as never)
+  expect(Object.keys(registered).sort()).toEqual(['haiku', 'opus'])
+  for (const a of Object.values(registered)) expect(a.disallowedTools).toEqual(expect.arrayContaining(['Edit', 'Write', 'Agent']))
+  expect(registered.haiku?.model).toBe('claude-haiku-5-5')
+  expect(registered.opus?.model).toBe('claude-opus-5-5')
 })
 
 test('pane shows the router state on terminal and VS Code', async ($, on) => {
-  on('agent.spawn', (_$, e) => ({ model: e.model ?? '', agentId: 'sonnet-2' }))
-  await $.agent.spawn({ subagentType: 'model-router:sonnet', prompt: HANDOFF, description: 'rename x' } as never)
+  on('agent.spawn', (_$, e) => ({ model: e.model ?? '', agentId: 'haiku-2' }))
+  await $.agent.spawn({ subagentType: 'model-router:haiku', prompt: HANDOFF, description: 'rename x' } as never)
   for (const surface of ['terminal', 'vscode'] as const) {
     const ui = await $.ui.mount({
       plugin: 'model-router',
@@ -104,7 +109,7 @@ test('pane shows the router state on terminal and VS Code', async ($, on) => {
       props: { title: 'Model router', isFocused: false, bodyColumns: 60, placement: 'dock' } as never,
     })
     expect(await ui.find({ type: 'Text', text: /model-router active/ })).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: /sonnet ▸ rename x/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /haiku ▸ rename x/ })).toBeDefined()
     await ui.unmount()
   }
 })
@@ -138,12 +143,18 @@ test('router-usage reports plan usage', async ($, on) => {
   expect(text.trimStart().startsWith('**Account plan')).toBe(true)
 })
 
-test('finished agents cannot be resumed', async ($, on) => {
-  on('agent.spawn', (_$, e) => ({ model: e.model ?? '', agentId: 'sonnet-9' }))
+test('a finished agent can be resumed while its cache is warm, not after', async ($, on) => {
+  const env: Record<string, string> = {}
+  stub(on, env)
+  on('agent.spawn', (_$, e) => ({ model: e.model ?? '', agentId: 'haiku-9' }))
   on('tool.call', () => ({ result: 'sent' }) as never)
-  await $.agent.spawn({ subagentType: 'model-router:sonnet', prompt: HANDOFF, description: 'x' } as never)
-  const r = await $.tool.call({ tool: 'SendMessage', to: 'sonnet-9', message: 'one more thing' } as never)
-  expect(JSON.stringify(r)).toContain('single-use')
+  await $.prompt.submit({ text: 'go' } as never)
+  await $.agent.spawn({ subagentType: 'model-router:haiku', prompt: HANDOFF, description: 'x', tool_use_id: 't-9' } as never)
+  await $.tool.call({ tool: 'Agent', subagent_type: 'model-router:haiku', description: 'x', prompt: HANDOFF, tool_use_id: 't-9' } as never)
+  expect((await $.tool.call({ tool: 'SendMessage', to: 'haiku-9', message: 'one more thing' } as never)).deny).toBeUndefined()
+  env.MODEL_ROUTER_RESUME_MINUTES = '0' // 0 minutes: every finished agent is past its window
+  await $.prompt.submit({ text: 'go' } as never)
+  expect(JSON.stringify(await $.tool.call({ tool: 'SendMessage', to: 'haiku-9', message: 'one more thing' } as never))).toContain('cache is cold')
 })
 
 test('router-usage reset clears the counters', async ($, on) => {
@@ -190,7 +201,6 @@ test('analytics appends prompt and tool events to a SQLite file', async ($, on) 
   on('env.get', (_$, e) => ({ value: e.name === 'HOME' ? '/home/test' : undefined }) as never)
   on('session.id', () => ({ value: 'chat-a' }) as never)
   on('session.messages', () => ({ value: [] }) as never)
-  on('model.complete', () => NO_ANSWER)
   on('prompt.submit', () => ({ text: 'go' }) as never)
   on('ui.open', () => ({ value: { isPlaced: false } }) as never)
   on('ui.status', () => ({ value: undefined }) as never)
@@ -206,13 +216,12 @@ test('analytics appends prompt and tool events to a SQLite file', async ($, on) 
   expect(out).toContain('/home/test/.claude/model-router-analytics.db')
   expect(out).toContain('CREATE TABLE IF NOT EXISTS events')
   expect(out).toContain("'prompt'")
-  expect(out).toContain("'route'")
   expect(out).toContain("'tool'")
   expect(out).toContain('"tool":"Read"')
 })
 
-test('the front desk gets the protocol on any model, but not inside a tier agent', async ($, on) => {
-  stub(on, () => ANSWER('medium'))
+test('the main chat gets the protocol on any model, but not inside a worker or advisor agent', async ($, on) => {
+  stub(on)
   on('prompt.compose', () => ({ sections: [] }) as never)
   let during = ''
   on('tool.call', async (_$, e) => {
@@ -221,8 +230,8 @@ test('the front desk gets the protocol on any model, but not inside a tier agent
   })
   const compose = (model: string) => $.prompt.compose({ model, promptModel: model, surfaces: [], tools: [], outputStyle: null, traits: [] } as never)
   for (const model of ['claude-opus-5-5', 'claude-sonnet-5-5']) expect(JSON.stringify(await compose(model))).toContain('model-router:protocol')
-  await $.prompt.submit({ text: '!sonnet fix the typo' } as never)
-  await $.tool.call({ tool: 'Agent', subagent_type: 'model-router:sonnet', description: 'x', prompt: HANDOFF } as never)
+  await $.prompt.submit({ text: 'fix the typo' } as never)
+  await $.tool.call({ tool: 'Agent', subagent_type: 'model-router:haiku', description: 'x', prompt: HANDOFF } as never)
   expect(during).not.toContain('model-router:protocol')
   expect(during).not.toContain('model-router:kb')
   expect(JSON.stringify(await compose('claude-sonnet-5-5'))).toContain('model-router:protocol')
@@ -255,36 +264,55 @@ test('session start marks the bullets of files changed since the knowledge base 
   expect(written).not.toContain('(stale?) (src/b.ts)')
 })
 
-test('the knowledge base is updated after each answer; NONE leaves it alone', async ($, on) => {
-  let reply = '- (repo) uses bun'
+test('an agent report adds its Facts to the knowledge base, with no model call', async ($, on) => {
+  let kb = '<!-- model-router knowledge base · checked at abc -->\n- (src/a.ts) old\n- (stale?) (src/b.ts) checked later\n'
+  let calls = 0
   const written: string[] = []
-  on('env.get', (_$, e) => ({ value: e.name === 'HOME' ? '/home/test' : undefined }) as never)
-  on('session.id', () => ({ value: 'chat-kb' }) as never)
-  on('session.usage', () => ({ value: { startedAt: 0, rateLimits: [] } }) as never)
-  on('model.complete', () => ANSWER(reply))
-  on('ui.open', () => ({ value: { isPlaced: false } }) as never)
-  on('ui.status', () => ({ value: undefined }) as never)
-  on('fs.read', (_$, e) => ({ value: e.path.endsWith('router-kb.md') ? 'kb text' : '{}' }) as never)
+  engine(on)
+  on('model.complete', () => {
+    calls++
+    return NO_ANSWER
+  })
+  on('fs.read', (_$, e) => ({ value: e.path.endsWith('router-kb.md') ? kb : '{}' }) as never)
   on('fs.write', (_$, e: { path: string; text: string }) => {
-    if (e.path.endsWith('router-kb.md')) written.push(e.text)
+    if (e.path.endsWith('router-kb.md')) {
+      kb = e.text
+      written.push(e.text)
+    }
     return { value: undefined } as never
   })
-  on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false } }) as never)
-  on('prompt.submit', (_$, e) => ({ text: e.text }) as never)
-  on('turn.complete', () => ({ text: '' }) as never)
-  await $.prompt.submit({ text: '!haiku do it' } as never)
-  await $.turn.complete({ answer: 'done', reason: 'answer', turnId: 't', durationMs: 1, isAborted: false } as never)
-  await new Promise(r => setTimeout(r, 20))
+  let text = 'done\n\n## Facts\n- (repo) uses bun\n- (src/a.ts) old\n- (src/b.ts) checked later'
+  on('tool.call', () => ({ result: 'done', text }) as never)
+  await $.tool.call({ tool: 'Agent', subagent_type: 'model-router:haiku', description: 'x', prompt: HANDOFF } as never)
+  expect(calls).toBe(0)
   expect(written).toHaveLength(1)
-  expect(written[0]).toContain('<!-- model-router knowledge base · checked at')
+  expect(written[0]).toContain('checked at abc')
   expect(written[0]).toContain('- (repo) uses bun')
-  reply = 'NONE'
-  await $.turn.complete({ answer: 'done', reason: 'answer', turnId: 't', durationMs: 1, isAborted: false } as never)
-  await new Promise(r => setTimeout(r, 20))
+  expect(written[0]).toContain('- (src/b.ts) checked later') // a fact the agent confirms loses its stale mark
+  expect(written[0]).not.toContain('(stale?)')
+  expect(written[0]?.match(/\(src\/a\.ts\) old/g)).toHaveLength(1) // no duplicates
+  text = 'done\n\n## Facts\nnone'
+  await $.tool.call({ tool: 'Agent', subagent_type: 'model-router:haiku', description: 'x', prompt: HANDOFF } as never)
   expect(written).toHaveLength(1)
 })
 
-test('tier agents get the session-start knowledge base, and later changes only when it moved', async ($, on) => {
+test('the knowledge base drops its oldest facts, not the new ones, past the character cap', async ($, on) => {
+  let kb = '<!-- model-router knowledge base · checked at abc -->\n- (a) first fact\n- (b) second fact\n'
+  engine(on, { MODEL_ROUTER_KB_CHARS: '40' })
+  on('prompt.submit', (_$, e) => ({ text: e.text }) as never)
+  on('fs.read', (_$, e) => ({ value: e.path.endsWith('router-kb.md') ? kb : '{}' }) as never)
+  on('fs.write', (_$, e: { path: string; text: string }) => {
+    if (e.path.endsWith('router-kb.md')) kb = e.text
+    return { value: undefined } as never
+  })
+  on('tool.call', () => ({ result: 'done', text: 'done\n\n## Facts\n- (c) third fact' }) as never)
+  await $.prompt.submit({ text: 'go' } as never)
+  await $.tool.call({ tool: 'Agent', subagent_type: 'model-router:haiku', description: 'x', prompt: HANDOFF } as never)
+  expect(kb).toContain('- (c) third fact')
+  expect(kb).not.toContain('first fact')
+})
+
+test('agents get the session-start knowledge base, and later changes only when it moved', async ($, on) => {
   let kb = 'kb text'
   let registered = ''
   let sent: { prompt?: string } = {}
@@ -299,7 +327,7 @@ test('tier agents get the session-start knowledge base, and later changes only w
   on('prompt.submit', (_$, e) => ({ text: e.text }) as never)
   on('session.start', (_$, e) => ({ cwd: e.cwd, value: undefined }) as never)
   on('agent.register', (_$, e) => {
-    if (e.name === 'sonnet') registered = String(e.prompt)
+    if (e.name === 'haiku') registered = String(e.prompt)
     return { value: undefined } as never
   })
   on('command.register', () => ({ value: undefined }) as never)
@@ -311,69 +339,18 @@ test('tier agents get the session-start knowledge base, and later changes only w
   })
   await $.session.start({ cwd: '/tmp' } as never)
   expect(registered).toContain('Knowledge base (.claude/router-kb.md, as of session start):\nkb text')
-  await $.prompt.submit({ text: '!sonnet go' } as never)
-  await $.tool.call({ tool: 'Agent', subagent_type: 'model-router:sonnet', description: 'x', prompt: HANDOFF } as never)
+  await $.prompt.submit({ text: 'go' } as never)
+  await $.tool.call({ tool: 'Agent', subagent_type: 'model-router:haiku', description: 'x', prompt: HANDOFF } as never)
   expect(sent.prompt).not.toContain('Knowledge base updates')
   kb = 'kb text 2'
-  await $.tool.call({ tool: 'Agent', subagent_type: 'model-router:sonnet', description: 'x', prompt: HANDOFF } as never)
+  await $.tool.call({ tool: 'Agent', subagent_type: 'model-router:haiku', description: 'x', prompt: HANDOFF } as never)
   expect(sent.prompt).toContain("## User's message (verbatim)\ngo\n\n## Knowledge base updates (newer than your system prompt)\nkb text 2")
-})
-
-test('a knowledge-base reply that hit the token cap is not written', async ($, on) => {
-  const written: string[] = []
-  on('env.get', (_$, e) => ({ value: e.name === 'HOME' ? '/home/test' : undefined }) as never)
-  on('session.id', () => ({ value: 'chat-cap' }) as never)
-  on('session.usage', () => ({ value: { startedAt: 0, rateLimits: [] } }) as never)
-  on('model.complete', () =>
-    ({ value: { isAnswered: true, text: '- (repo) fact', usage: { input_tokens: 10, output_tokens: 16000, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } }) as never,
-  )
-  on('ui.open', () => ({ value: { isPlaced: false } }) as never)
-  on('ui.status', () => ({ value: undefined }) as never)
-  on('fs.read', (_$, e) => ({ value: e.path.endsWith('router-kb.md') ? 'kb text' : '{}' }) as never)
-  on('fs.write', (_$, e: { path: string; text: string }) => {
-    if (e.path.endsWith('router-kb.md')) written.push(e.text)
-    return { value: undefined } as never
-  })
-  on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false } }) as never)
-  on('turn.complete', () => ({ text: '' }) as never)
-  await $.turn.complete({ answer: 'done', reason: 'answer', turnId: 't', durationMs: 1, isAborted: false } as never)
-  await new Promise(r => setTimeout(r, 20))
-  expect(written).toHaveLength(0)
-})
-
-test('session end waits for a pending knowledge-base update', async ($, on) => {
-  const written: string[] = []
-  let release = () => {}
-  const gate = new Promise<void>(r => (release = r))
-  on('env.get', (_$, e) => ({ value: e.name === 'HOME' ? '/home/test' : undefined }) as never)
-  on('session.id', () => ({ value: 'chat-end' }) as never)
-  on('session.usage', () => ({ value: { startedAt: 0, rateLimits: [] } }) as never)
-  on('model.complete', async () => {
-    await gate
-    return ANSWER('- (repo) uses bun') as never
-  })
-  on('ui.open', () => ({ value: { isPlaced: false } }) as never)
-  on('ui.status', () => ({ value: undefined }) as never)
-  on('fs.read', (_$, e) => ({ value: e.path.endsWith('router-kb.md') ? 'kb text' : '{}' }) as never)
-  on('fs.write', (_$, e: { path: string; text: string }) => {
-    if (e.path.endsWith('router-kb.md')) written.push(e.text)
-    return { value: undefined } as never
-  })
-  on('process.run', () => ({ value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false } }) as never)
-  on('turn.complete', () => ({ text: '' }) as never)
-  on('session.end', (_$, e) => ({ sessionId: e.sessionId }) as never)
-  await $.turn.complete({ answer: 'done', reason: 'answer', turnId: 't', durationMs: 1, isAborted: false } as never)
-  const ending = $.session.end({ reason: 'other', sessionId: 'chat-end', resume: {} } as never)
-  expect(written).toHaveLength(0)
-  release()
-  await ending
-  expect(written).toHaveLength(1)
 })
 
 // Last tests: the overrides they set stay in the module for the rest of this file.
 test('MODEL_ROUTER_* env vars override the settings at session start', async ($, on) => {
-  const env: Record<string, string> = { MODEL_ROUTER_MEDIUM_MODEL: 'claude-opus-5-5', MODEL_ROUTER_KB_CHARS: '4' }
-  stub(on, () => ANSWER('medium'), env)
+  const env: Record<string, string> = { MODEL_ROUTER_WORKER_MODEL: 'claude-opus-5-5', MODEL_ROUTER_KB_CHARS: '4' }
+  stub(on, env)
   let spawned = ''
   let registered = ''
   on('session.start', (_$, e) => ({ cwd: e.cwd, value: undefined }) as never)
@@ -387,11 +364,11 @@ test('MODEL_ROUTER_* env vars override the settings at session start', async ($,
   on('tool.call', () => ({ result: 'ran' }) as never)
   on('agent.spawn', (_$, e) => {
     spawned = e.model ?? ''
-    return { model: e.model ?? '', agentId: 'sonnet-env' }
+    return { model: e.model ?? '', agentId: 'haiku-env' }
   })
   await $.session.start({ cwd: '/tmp' } as never)
   await $.prompt.submit({ text: 'go' } as never)
-  await $.agent.spawn({ subagentType: 'model-router:sonnet', prompt: HANDOFF, description: 'x', tool_use_id: 't-env' } as never)
+  await $.agent.spawn({ subagentType: 'model-router:haiku', prompt: HANDOFF, description: 'x', tool_use_id: 't-env' } as never)
   expect(spawned).toBe('claude-opus-5-5')
   expect(registered).toContain('as of session start):\nkb t')
   expect(registered).not.toContain('kb text')
@@ -399,7 +376,7 @@ test('MODEL_ROUTER_* env vars override the settings at session start', async ($,
 
 test('MODEL_ROUTER_* env vars are re-read on every prompt', async ($, on) => {
   const env: Record<string, string> = {}
-  stub(on, () => ANSWER('medium'), env)
+  stub(on, env)
   let spawned = ''
   on('session.start', (_$, e) => ({ cwd: e.cwd, value: undefined }) as never)
   on('agent.register', () => ({ value: undefined }) as never)
@@ -409,18 +386,18 @@ test('MODEL_ROUTER_* env vars are re-read on every prompt', async ($, on) => {
   on('tool.call', () => ({ result: 'ran' }) as never)
   on('agent.spawn', (_$, e) => {
     spawned = e.model ?? ''
-    return { model: e.model ?? '', agentId: 'sonnet-reload' }
+    return { model: e.model ?? '', agentId: 'haiku-reload' }
   })
   await $.session.start({ cwd: '/tmp' } as never)
-  env.MODEL_ROUTER_MEDIUM_MODEL = 'claude-opus-5-5'
+  env.MODEL_ROUTER_WORKER_MODEL = 'claude-opus-5-5'
   await $.prompt.submit({ text: 'go' } as never)
-  await $.agent.spawn({ subagentType: 'model-router:sonnet', prompt: HANDOFF, description: 'x', tool_use_id: 't-reload' } as never)
+  await $.agent.spawn({ subagentType: 'model-router:haiku', prompt: HANDOFF, description: 'x', tool_use_id: 't-reload' } as never)
   expect(spawned).toBe('claude-opus-5-5')
 })
 
 test('the front desk gets the ADHD output style unless MODEL_ROUTER_STYLE=off', async ($, on) => {
   const env: Record<string, string> = {}
-  stub(on, () => ANSWER('simple'), env)
+  stub(on, env)
   on('prompt.compose', () => ({ sections: [] }) as never)
   const compose = () => $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: [], tools: [], outputStyle: null, traits: [] } as never)
   await $.prompt.submit({ text: 'go' } as never)

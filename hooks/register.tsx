@@ -1,38 +1,26 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, ModelUsage, Register, SessionMessage, SessionRateLimit } from 'claude-code'
+import type { EngineInterface, ModelUsage, Register, SessionRateLimit } from 'claude-code'
 
 // Defaults; each can be overridden by a MODEL_ROUTER_* env var (README.md › Configure), read at session start and on every prompt.
-let SIMPLE = 'claude-haiku-5-5' // the main chat (front desk) and simple tasks
-let SIMPLE_EFFORT = 'high'
-let MEDIUM = 'claude-sonnet-5-5'
-let MEDIUM_EFFORT = 'high'
-let COMPLEX = 'claude-opus-5-5'
-let COMPLEX_EFFORT = 'high'
-let CLASSIFIER = 'claude-haiku-5-5'
-let CLASSIFIER_EFFORT = 'low'
-let KB_EFFORT = 'high'
+let MAIN = 'claude-sonnet-5-5' // the main chat: one model for the whole session, so its prompt cache stays warm
+let MAIN_EFFORT = 'high'
+let WORKER = 'claude-haiku-5-5' // bulk, checkable work: reading, searching, summarising, test runs
+let WORKER_EFFORT = 'medium'
+let ADVISOR = 'claude-opus-5-5' // read-only second opinion on hard calls
+let ADVISOR_EFFORT = 'high'
 let KB_CHARS = 8000 // knowledge base characters sent to the main chat and to each agent
-const KB_MAX_TOKENS = 16_000 // output tokens for the updater, thinking included: a reply that reaches it was cut off
+let RESUME_MS = 55 * 60_000 // a finished agent can be resumed this long: the prompt cache lives 1 hour
 let ANALYTICS = 'off' // SQLite file every router event is appended to (README.md › Analytics); 'off' disables it
-const MEDIUM_TYPE = 'model-router:sonnet'
-const COMPLEX_TYPE = 'model-router:opus'
+const WORKER_TYPE = 'model-router:haiku'
+const ADVISOR_TYPE = 'model-router:opus'
 const KB = '.claude/router-kb.md' // durable repo facts, shared by every model
 const HANDOFF = ['## Goal', '## Context', '## Scope', '## Done when']
-type Tier = 'simple' | 'medium' | 'complex'
-const modelOfTier = (t: string) => (t === 'medium' ? MEDIUM : t === 'complex' ? COMPLEX : SIMPLE)
-const effortOfTier = (t: string) => (t === 'medium' ? MEDIUM_EFFORT : t === 'complex' ? COMPLEX_EFFORT : SIMPLE_EFFORT)
-const typeOfTier = (t: string) => (t === 'medium' ? MEDIUM_TYPE : COMPLEX_TYPE)
-const tierOfType = (type: string): Tier | undefined => (type === MEDIUM_TYPE ? 'medium' : type === COMPLEX_TYPE ? 'complex' : undefined)
+type Role = 'worker' | 'advisor'
+const modelOfRole = (r: string) => (r === 'worker' ? WORKER : ADVISOR)
+const effortOfRole = (r: string) => (r === 'worker' ? WORKER_EFFORT : ADVISOR_EFFORT)
+const typeOfRole = (r: string) => (r === 'worker' ? WORKER_TYPE : ADVISOR_TYPE)
+const roleOfType = (type: string): Role | undefined => (type === WORKER_TYPE ? 'worker' : type === ADVISOR_TYPE ? 'advisor' : undefined)
 
-const RUBRIC = [
-  'Classify the coding-assistant task in the user message by how much reasoning it needs. Answer with one word: simple, medium or complex.',
-  '- simple: the message and context say exactly what to do: edit, rename or fix a named thing, run a command, read or explain a given file, a factual lookup, a short follow-up.',
-  '- medium: some open-ended parts: debug an unclear failure, add a feature across a few files, choose between approaches inside one module, review a change.',
-  '- complex: architecture or design across modules, large refactors, vague goals that need a plan, security or performance analysis, anything where a wrong call is costly.',
-  'When unsure between two levels, answer the higher one.',
-].join('\n')
-const FORCE = /^!(haiku|sonnet|opus)\b\s*/i // a message starting with !haiku, !sonnet or !opus skips the classifier
-const FORCED: Record<string, Tier> = { haiku: 'simple', sonnet: 'medium', opus: 'complex' }
 const KB_HEADER = /^<!-- model-router knowledge base · checked at (\w*) -->\n?/ // first line: the commit the facts were checked against
 const ADHD_STYLE = [
   'How you write to the user (output style adapted from github.com/ayghri/i-have-adhd, MIT): the reader has ADHD, so every reply must be easy to act on.',
@@ -48,27 +36,15 @@ const ADHD_STYLE = [
   '- When the user asks to explain or walk through something, explain fully, with headers to skim.',
   '- When relaying an agent report, reshape it this way; do not paste it whole.',
 ].join('\n')
-const KB_RULES = () =>
-  [
-    'You maintain a knowledge base of durable facts about one code repository, shared by the AI models that work on it.',
-    'Given the current knowledge base and one finished turn, return the full updated knowledge base, or exactly NONE when nothing should change.',
-    '- One fact per bullet: "- (relative/path) fact"; use (repo) for repo-wide facts.',
-    '- Keep only durable facts: what a file or module does, conventions, decisions and why, gotchas, commands that work. Never task status, plans or anything about this conversation.',
-    '- Keep every existing bullet unless this turn contradicts it (fix or drop it) or it duplicates another (merge them).',
-    '- A bullet marked "(stale?)" may be outdated: remove the mark only when this turn confirms the fact; fix or drop it when the turn contradicts it.',
-    `- Stay under ${KB_CHARS} characters: when over, merge related bullets and drop the least useful.`,
-    '- Output only the bullets (no header, no code fence, no commentary), or NONE.',
-  ].join('\n')
-
 const protocol = () =>
   [
     'Model router (enforced by the model-router plugin):',
-    '- You are the front desk: you hold the conversation and talk to the user. A classifier routes every user message to a tier; a note after the message says which.',
-    '- simple: do it yourself with your own tools.',
-    `- medium / complex: hand it to fresh ${MEDIUM_TYPE} (${label(MEDIUM)}) or ${COMPLEX_TYPE} (${label(COMPLEX)}) agents, as the note says; spawn several in ONE message for independent pieces. Every other tool call is refused for that message.`,
+    `- You are the main thread (${label(MAIN)}): you talk to the user, read the code and make the edits yourself. Your model never changes during a session, which keeps its prompt cache warm.`,
+    `- Delegate down to ${WORKER_TYPE} (${label(WORKER)}) for bulk, checkable work: reading or searching many files, summarising long logs or command output, running tests or builds and reporting the failures. It cannot edit files. Spawn several in ONE message for independent pieces.`,
+    `- Consult ${ADVISOR_TYPE} (${label(ADVISOR)}, read-only) when a change touches more than 5 files or modules, when a design, security or performance call is costly to get wrong, or when the same fix or test has failed twice. It returns a plan or review; you make the edits.`,
     `- A handoff document has these headings, in order: ${HANDOFF.join(', ')}. The agent starts with no context: put in everything it needs (absolute paths, what was said and decided earlier in this conversation, constraints, what to report back). Scope names the files or areas it may touch and what is out of scope.`,
-    '- Agents are single-use: never SendMessage a finished one; spawn a fresh one with a new handoff.',
-    `- Knowledge base: the router keeps ${KB} up to date after every turn; do not edit it. Bullets marked (stale?) may be outdated: check the file before relying on them.`,
+    `- A finished agent can be resumed with SendMessage for a follow-up for about ${Math.round(RESUME_MS / 60_000)} minutes, while its context is still cached; after that spawn a fresh one with a new handoff.`,
+    `- Knowledge base: the router appends the "## Facts" of every agent report to ${KB}; do not edit it. Bullets marked (stale?) may be outdated: check the file before relying on them.`,
     ...(kbSnapshot ? ['', `Knowledge base (${KB}, as of session start):`, kbSnapshot] : []),
     ...(STYLE === 'adhd' ? ['', ADHD_STYLE] : []),
   ].join('\n')
@@ -77,15 +53,17 @@ const TEMPLATE = HANDOFF.map(h => `${h}\n...`).join('\n\n')
 
 type Row = { calls: number; input: number; output: number; cacheRead: number; cacheWrite: number }
 type Ledger = Record<string, Record<string, Row>> // UTC hour 'YYYY-MM-DDTHH' (older data: day) -> 'part:model' -> totals
-type Part = 'chat' | 'classify' | 'kb' | 'handoff' | 'medium' | 'complex' | 'coder' | 'review' | 'subagent'
+type Part = 'chat' | 'classify' | 'kb' | 'handoff' | Role | 'medium' | 'complex' | 'coder' | 'review' | 'subagent'
 
 const PARTS: [Part, string][] = [
-  ['chat', 'Front desk (simple)'],
-  ['classify', '↳ routing'],
-  ['kb', '↳ knowledge base'],
+  ['chat', 'Main thread'],
+  ['classify', '↳ routing (old)'],
+  ['kb', '↳ knowledge base (old)'],
   ['handoff', '↳ handoff docs (est.)'],
-  ['medium', 'Medium agents'],
-  ['complex', 'Complex agents'],
+  ['worker', 'Worker agents'],
+  ['advisor', 'Advisor agents'],
+  ['medium', 'Medium agents (old)'],
+  ['complex', 'Complex agents (old)'],
   ['coder', 'executors (old)'],
   ['review', 'reviews (old)'],
   ['subagent', 'other subagents'],
@@ -95,19 +73,16 @@ const KEEP_DAYS = 35 // ponytail: older buckets are dropped at session start; ex
 
 const runs = atom({ plugin: 'model-router', key: 'runs' } as const, [])
 const today = atom({ plugin: 'model-router', key: 'today' } as const, {})
-const route = atom({ plugin: 'model-router', key: 'route' } as const, '')
 const PANE = 'model-router'
 let isPaneShown = false // module state: a reload reopens the pane once
-let tier: Tier = 'simple' // the current message's tier, set by the classifier on every prompt
 let userText = '' // the current user message, sent verbatim to agents
 let kbSnapshot = '' // the knowledge base at session start, for the main chat's system prompt
-let reports: string[] = [] // the tier agents' reports this turn, read by the knowledge base updater
-let kbWrites: Promise<unknown> = Promise.resolve() // knowledge base updates, one after another
+let kbWrites: Promise<unknown> = Promise.resolve() // knowledge base appends, one after another
 let STYLE = 'adhd' // the front desk's output style: 'adhd' (ADHD_STYLE in the protocol) or 'off' (MODEL_ROUTER_STYLE)
-const agents = new Map<string, Tier>() // running medium/complex agentId -> tier
-let inAgent = 0 // tier agents in flight: while > 0 the main chat is blocked, so a prompt.compose is for a subagent
+const agents = new Map<string, Role>() // worker/advisor agentId -> role, kept after the agent finishes so a resumed run keeps its model's effort
+let inAgent = 0 // worker/advisor runs in flight: while > 0 the main chat is blocked, so a prompt.compose is for a subagent
 const agentOf = new Map<string, string>() // Agent tool_use_id -> agentId
-const spent = new Set<string>() // every agent agentId and name: they are single-use
+const idle = new Map<string, number>() // finished agent agentId and name -> when it finished: resumable for RESUME_MS
 
 let ledger: Ledger = {}
 
@@ -153,8 +128,6 @@ const dur = (ms: number) => {
   const m = Math.max(0, Math.round(ms / 60_000))
   return m >= 1440 ? `${Math.floor(m / 1440)}d ${Math.floor((m % 1440) / 60)}h` : `${Math.floor(m / 60)}h ${m % 60}m`
 }
-const lastText = (msgs: SessionMessage[], role: SessionMessage['role']) =>
-  [...msgs].reverse().find(m => m.role === role && m.text.trim())?.text.slice(-10_000) ?? ''
 const kbBody = (text: string) => text.replace(KB_HEADER, '')
 const writeKb = ($: EngineInterface, body: string, sha: string) =>
   $.fs.write(KB, `<!-- model-router knowledge base · checked at ${sha} -->\n${body.trim()}\n`)
@@ -188,36 +161,33 @@ async function checkKb($: EngineInterface) {
   }
 }
 
-// After a main-chat answer: the updater rewrites the knowledge base from the turn, or leaves it alone on NONE.
-async function updateKb($: EngineInterface, user: string, answer: string, notes: string[]) {
+// After an agent reports: its "## Facts" bullets are appended as written (no model rewrites the file); one already there is confirmed (its stale mark goes).
+// Over KB_CHARS the oldest bullets go first, never the new ones.
+async function addFacts($: EngineInterface, report: string) {
+  const parts = report.split(/^## Facts[ \t]*$/m)
+  const facts = parts.length < 2 ? [] : (parts.pop() ?? '').split('\n').map(l => l.trim()).filter(l => l.startsWith('- ') && !/^- none\.?$/i.test(l))
+  if (facts.length === 0) return
   const text = String(await $.fs.read(KB).catch(() => ''))
-  const sha = KB_HEADER.exec(text)?.[1] ?? ''
-  const body = kbBody(text)
-  const r = await $.model
-    .complete({
-      model: SIMPLE,
-      effort: KB_EFFORT as never,
-      maxTokens: KB_MAX_TOKENS,
-      timeoutMs: 120_000,
-      system: KB_RULES(),
-      prompt: [
-        { text: `Knowledge base now (${body.length} of ${KB_CHARS} characters):\n${body || '(empty)'}`, cache: true },
-        { text: `This turn\n\nUser message:\n${user}\n\nFinal answer:\n${answer.slice(-6000)}\n\nAgent reports:\n${notes.join('\n---\n').slice(-12000) || '(none)'}` },
-      ],
-    })
-    .catch(() => undefined)
-  if (r?.usage) await meter($, 'kb', SIMPLE, fromUsage(r.usage))
-  if (r?.isAnswered && r.usage.output_tokens >= KB_MAX_TOKENS) return // a reply that hit the cap is cut off: never write a partial knowledge base
-  const out = r?.isAnswered ? r.text.trim() : ''
-  if (out === '' || out === 'NONE') return
-  const next = out
-    .split('\n')
-    .filter(l => l.startsWith('- '))
-    .join('\n')
-  if (!next) return
-  if (body.length > 1000 && next.length < body.length / 2) return // ponytail: a rewrite that drops over half the facts is refused
-  await writeKb($, next, sha)
-  record($, 'kb', { model: SIMPLE, detail: { before: body.length, after: next.length } })
+  const body = kbBody(text).trim()
+  const lines = body ? body.split('\n') : []
+  let added = 0
+  for (const f of facts) {
+    const i = lines.findIndex(l => l.replace('- (stale?) ', '- ') === f)
+    if (i >= 0) lines[i] = f
+    else {
+      lines.push(f)
+      added++
+    }
+  }
+  const drop = () => {
+    const i = lines.findIndex(l => l.startsWith('- '))
+    return i >= 0 && i < lines.length - added && lines.splice(i, 1).length > 0
+  }
+  while (lines.join('\n').length > KB_CHARS && drop());
+  const next = lines.join('\n')
+  if (next === body) return
+  await writeKb($, next, KB_HEADER.exec(text)?.[1] ?? '')
+  record($, 'kb', { detail: { before: body.length, after: next.length } })
 }
 
 // Sums every bucket that overlaps [start, now), per 'part:model'; a bucket cut by `start` counts pro rata.
@@ -299,16 +269,15 @@ async function loadSettings($: EngineInterface) {
     return Number.isInteger(n) && n > 0 ? n : fallback
   }
   const effort = (v: string | undefined, fallback: string) => (v && /^(low|medium|high|xhigh|max)$/.test(v) ? v : fallback)
-  SIMPLE = str(await $.env.get('MODEL_ROUTER_SIMPLE_MODEL'), 'claude-haiku-5-5')
-  SIMPLE_EFFORT = effort(await $.env.get('MODEL_ROUTER_SIMPLE_EFFORT'), 'high')
-  MEDIUM = str(await $.env.get('MODEL_ROUTER_MEDIUM_MODEL'), 'claude-sonnet-5-5')
-  MEDIUM_EFFORT = effort(await $.env.get('MODEL_ROUTER_MEDIUM_EFFORT'), 'high')
-  COMPLEX = str(await $.env.get('MODEL_ROUTER_COMPLEX_MODEL'), 'claude-opus-5-5')
-  COMPLEX_EFFORT = effort(await $.env.get('MODEL_ROUTER_COMPLEX_EFFORT'), 'high')
-  CLASSIFIER = str(await $.env.get('MODEL_ROUTER_CLASSIFIER_MODEL'), 'claude-haiku-5-5')
-  CLASSIFIER_EFFORT = effort(await $.env.get('MODEL_ROUTER_CLASSIFIER_EFFORT'), 'low')
-  KB_EFFORT = effort(await $.env.get('MODEL_ROUTER_KB_EFFORT'), 'high')
+  MAIN = str(await $.env.get('MODEL_ROUTER_MAIN_MODEL'), 'claude-sonnet-5-5')
+  MAIN_EFFORT = effort(await $.env.get('MODEL_ROUTER_MAIN_EFFORT'), 'high')
+  WORKER = str(await $.env.get('MODEL_ROUTER_WORKER_MODEL'), 'claude-haiku-5-5')
+  WORKER_EFFORT = effort(await $.env.get('MODEL_ROUTER_WORKER_EFFORT'), 'medium')
+  ADVISOR = str(await $.env.get('MODEL_ROUTER_ADVISOR_MODEL'), 'claude-opus-5-5')
+  ADVISOR_EFFORT = effort(await $.env.get('MODEL_ROUTER_ADVISOR_EFFORT'), 'high')
   KB_CHARS = num(await $.env.get('MODEL_ROUTER_KB_CHARS'), 8000)
+  const minutes = await $.env.get('MODEL_ROUTER_RESUME_MINUTES')
+  RESUME_MS = (minutes && Number.isInteger(Number(minutes)) && Number(minutes) >= 0 ? Number(minutes) : 55) * 60_000 // 0 turns resuming off
   STYLE = (await $.env.get('MODEL_ROUTER_STYLE')) === 'off' ? 'off' : 'adhd'
   const home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? '.'
   ANALYTICS = str(await $.env.get('MODEL_ROUTER_ANALYTICS_DB'), `${home}/.claude/model-router-analytics.db`)
@@ -454,7 +423,6 @@ async function report($: EngineInterface) {
 
 async function card($: EngineInterface) {
   const list = await read($, runs)
-  const last = await read($, route)
   const usage = Object.entries(await read($, today)).map(([m, v]) => `${m} ${k(v)}`).join(' · ') || 'no usage yet'
   const reading = await planReading($)
   const plan =
@@ -466,17 +434,14 @@ async function card($: EngineInterface) {
     '',
     '| role | model |',
     '|---|---|',
-    `| front desk (simple) | ${label(SIMPLE)} · ${SIMPLE_EFFORT} |`,
-    `| medium | ${label(MEDIUM)} · ${MEDIUM_EFFORT} |`,
-    `| complex | ${label(COMPLEX)} · ${COMPLEX_EFFORT} |`,
-    `| classifier | ${label(CLASSIFIER)} · ${CLASSIFIER_EFFORT} |`,
-    '',
-    `**Last route:** ${last || 'none yet'}`,
+    `| main thread | ${label(MAIN)} · ${MAIN_EFFORT} |`,
+    `| worker | ${label(WORKER)} · ${WORKER_EFFORT} |`,
+    `| advisor | ${label(ADVISOR)} · ${ADVISOR_EFFORT} |`,
     '',
     `**Plan (all devices):** ${plan}`,
     '',
     `**Today:** ${usage}`,
-    ...list.map(run => `- ${short(modelOfTier(run.tier))} ▸ ${run.task}`),
+    ...list.map(run => `- ${short(modelOfRole(run.role))} ▸ ${run.task}`),
   ].join('\n')
 }
 
@@ -503,15 +468,22 @@ export const register: Register = on => {
     $.ui.status(usageLine())
     await update($, today, () => totals())
     kbSnapshot = await checkKb($)
-    for (const t of ['medium', 'complex'] as const) {
-      const model = modelOfTier(t)
+    const TASK = {
+      worker: 'Do the reading, searching or running the handoff asks for, inside the Scope, and report what you found with paths and line numbers; quote only what the main thread needs.',
+      advisor: 'Read what you need, then give a plan or review: the recommendation first, then numbered steps with paths, then the risks.',
+    }
+    for (const role of ['worker', 'advisor'] as const) {
+      const model = modelOfRole(role)
       await $.agent.register({
-        name: typeOfTier(t).replace('model-router:', ''),
-        description: `${label(model)} agent for ${t} tasks routed by the model-router classifier. The prompt must be a handoff document (${HANDOFF.join(', ')}). Spawn several in one message for independent pieces.`,
-        prompt: `You are a ${label(model)} agent. You get a handoff document from the front desk, the user's message verbatim and the repo's knowledge base. Do the work yourself, inside the Scope, using your own judgment for details it leaves open. For edits, make the smallest diff that works and match the surrounding style. Bullets in the knowledge base marked (stale?) may be outdated: check before relying on them. Do not edit ${KB}; the router maintains it. Finish with a short report the front desk can relay as is: first line the outcome; then what you changed, as a numbered list with paths; problems as cause and fix; anything you could not do. End it with a "## Facts" section: durable facts you learned about this repo, one per line as "- (relative/path) fact", or "none".${kbSnapshot ? `\n\nKnowledge base (${KB}, as of session start):\n${kbSnapshot}` : ''}`,
+        name: typeOfRole(role).replace('model-router:', ''),
+        description:
+          role === 'worker'
+            ? `${label(model)} worker for bulk, checkable work: reading or searching many files, summarising long logs or command output, running tests or builds. Read-only. The prompt must be a handoff document (${HANDOFF.join(', ')}). Spawn several in one message for independent pieces.`
+            : `${label(model)} read-only advisor for hard calls: a change across more than 5 files or modules, a costly design, security or performance decision, a fix or test that failed twice. It returns a plan or review, not edits. The prompt must be a handoff document (${HANDOFF.join(', ')}).`,
+        prompt: `You are a ${label(model)} ${role} agent. You get a handoff document from the main thread, the user's message verbatim and the repo's knowledge base. ${TASK[role]} You cannot edit files and must not change anything with a command. Bullets in the knowledge base marked (stale?) may be outdated: check before relying on them. Do not edit ${KB}; the router appends your "## Facts" to it. Finish with a short report the main thread can relay as is: first line the outcome; problems as cause and fix; anything you could not do. End it with a "## Facts" section: durable facts you learned about this repo, one per line as "- (relative/path) fact", or "none".${kbSnapshot ? `\n\nKnowledge base (${KB}, as of session start):\n${kbSnapshot}` : ''}`,
         model,
-        effort: effortOfTier(t) as never,
-        disallowedTools: ['Agent'],
+        effort: effortOfRole(role) as never,
+        disallowedTools: ['Agent', 'Edit', 'Write', 'NotebookEdit'],
       })
     }
     await $.command.register({
@@ -525,155 +497,104 @@ export const register: Register = on => {
   })
 
   // A prompt counts as asked, so the pane is placed at any width (VS Code's narrow panel included); re-reads MODEL_ROUTER_* so /reload-plugins applies changes.
-  // Every prompt is classified (or forced by a !haiku, !sonnet or !opus prefix); the note tells the main chat which tier it got.
   on('prompt.submit', async ($, e, next) => {
     await loadSettings($)
     if (!isPaneShown) isPaneShown = (await $.ui.open({ id: PANE, title: 'Model router' })).isPlaced
-    const m = FORCE.exec(e.text)
-    const forced = m ? FORCED[(m[1] ?? '').toLowerCase()] : undefined
-    const text = m ? e.text.slice(m[0].length) : e.text
-    if (forced) tier = forced
-    else {
-      const last = lastText(await $.session.messages().catch(() => []), 'assistant').slice(-2000)
-      const r = await $.model
-        .complete({
-          model: CLASSIFIER,
-          effort: CLASSIFIER_EFFORT as never,
-          maxTokens: 256,
-          timeoutMs: 20_000,
-          system: RUBRIC,
-          prompt: `Previous assistant reply (context):\n${last || '(none)'}\n\nUser message:\n${e.text}`,
-        })
-        .catch(() => undefined)
-      if (r?.usage) await meter($, 'classify', CLASSIFIER, fromUsage(r.usage))
-      const word = r?.isAnswered ? /simple|medium|complex/.exec(r.text.toLowerCase())?.[0] : undefined
-      tier = (word as Tier | undefined) ?? 'medium' // ponytail: a failed classification routes to medium
-    }
-    userText = text
-    reports = []
-    record($, 'route', { model: CLASSIFIER, detail: { tier, forced: Boolean(forced) } })
-    await update($, route, () => `${tier}${forced ? ' (forced)' : ''} · ${new Date().toTimeString().slice(0, 5)}`)
-    record($, 'prompt', {
-      detail: { settings: { SIMPLE, SIMPLE_EFFORT, MEDIUM, MEDIUM_EFFORT, COMPLEX, COMPLEX_EFFORT, CLASSIFIER, CLASSIFIER_EFFORT, KB_EFFORT, KB_CHARS, STYLE } },
-    })
-    const note =
-      tier === 'simple'
-        ? `Model router: this message is routed to you (${label(SIMPLE)}, simple). Do it yourself.`
-        : `Model router: this message is routed to ${label(modelOfTier(tier))} (${tier}). Your first and only tool calls this turn: spawn ${typeOfTier(tier)} with a handoff document (${HANDOFF.join(', ')}); several in one message for independent pieces. Every other tool is refused this turn. The router attaches the user's message verbatim and the knowledge base. When the agents return, relay their reports to the user.`
-    return next({ ...e, text, context: [...(e.context ?? []), note] })
+    userText = e.text
+    record($, 'prompt', { detail: { settings: { MAIN, MAIN_EFFORT, WORKER, WORKER_EFFORT, ADVISOR, ADVISOR_EFFORT, KB_CHARS, RESUME_MS, STYLE } } })
+    return next(e)
   })
 
-  // The front desk gets the protocol whatever model the session names; tier agents (composed while one is in flight) do not.
+  // The main chat gets the protocol whatever model the session names; worker and advisor agents (composed while one is in flight) do not.
   on('prompt.compose', async ($, e, next) => {
     const r = await next(e)
     if (inAgent > 0) return r
     return { sections: [...r.sections, { id: 'model-router:protocol', text: protocol(), scope: 'session' as const }] }
   })
 
-  // Only the main chat keeps state: subagents are single-use, so they are never compacted (one that overflows ends and the main chat re-delegates).
+  // Only the main chat is compacted: a compaction rewrites the agent's cached prefix, so an agent that overflows ends and the main chat re-delegates.
   on('session.compact', ($, e, next) =>
-    e.agentId ? { skip: 'model-router: subagents are single-use and are not compacted.' } : next(e),
+    e.agentId ? { skip: 'model-router: subagents are not compacted.' } : next(e),
   )
 
-  // Router: the main chat runs on its simple model, tier agents at their tier's effort (the session's effort setting does not apply to them); every request is metered by part.
+  // Router: the main chat runs on its one model, worker and advisor agents at their role's effort (the session's effort setting does not apply to them); every request is metered by part.
   on('turn.step', async function* ($, e, next) {
-    const t = e.agentId ? agents.get(e.agentId) : undefined
-    const effort = (!e.agentId ? SIMPLE_EFFORT : t ? effortOfTier(t) : e.effort) as never
-    const r = yield* next(!e.agentId ? { ...e, model: SIMPLE, effort } : { ...e, effort })
-    const part: Part = !e.agentId ? 'chat' : ((t as Part | undefined) ?? 'subagent')
+    const role = e.agentId ? agents.get(e.agentId) : undefined
+    const effort = (!e.agentId ? MAIN_EFFORT : role ? effortOfRole(role) : e.effort) as never
+    const r = yield* next(!e.agentId ? { ...e, model: MAIN, effort } : { ...e, effort })
+    const part: Part = !e.agentId ? 'chat' : (role ?? 'subagent')
     if (r.usage) await meter($, part, r.usage.model, fromUsage(r.usage))
     if (r.usage) record($, 'request', { part, model: r.usage.model, effort, agent: e.agentId, row: fromUsage(r.usage) })
     return r
   })
 
-  // Medium and complex agents run on their tier's model, in the foreground and single-use.
+  // Worker and advisor agents run on their role's model, in the foreground.
   on('agent.spawn', async ($, e, next) => {
-    const t = tierOfType(e.subagentType)
-    if (!t) return next(e)
-    const r = await next({ ...e, model: modelOfTier(t), background: false })
+    const role = roleOfType(e.subagentType)
+    if (!role) return next(e)
+    const r = await next({ ...e, model: modelOfRole(role), background: false })
     const id = r.agentId
     if (id) {
-      agents.set(id, t)
+      agents.set(id, role)
       agentOf.set(e.tool_use_id, id)
-      spent.add(id)
-      if (e.name) spent.add(e.name)
-      await update($, runs, list => [...list, { id, task: e.description, tier: t }])
+      await update($, runs, list => [...list, { id, task: e.description, role }])
     }
     return r
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'model-router: agent routing failed.' }))
 
-  // The main chat is routed by tier: a medium or complex message may spawn only its tier's agent, and no other tool runs.
-  on('tool.call', ($, e, next) => {
-    if (e.agentId || tier === 'simple') return next(e)
-    const type = typeOfTier(tier)
-    const { subagent_type } = e as unknown as { subagent_type?: string }
-    if (e.tool === 'Agent' && subagent_type === type) return next(e)
-    return { deny: `model-router: this message is routed to ${tier}. Hand it to ${type} with a handoff document (${HANDOFF.join(', ')}); no other tool runs this turn.` }
-  })
-
-  // Tier agents get a handoff document with every heading, plus the user's message verbatim and the knowledge base, read fresh.
+  // Worker and advisor agents get a handoff document with every heading, plus the user's message verbatim and the knowledge base, read fresh.
   on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
-    const t = tierOfType(e.subagent_type)
-    if (t === undefined) return next(e)
+    const role = roleOfType(e.subagent_type)
+    if (role === undefined) return next(e)
     if (!HANDOFF.every(h => e.prompt.includes(h)))
       return { deny: `model-router: an agent prompt must be a handoff document with these headings:\n\n${TEMPLATE}` }
-    await meter($, 'handoff', SIMPLE, { calls: 1, input: 0, output: Math.round(e.prompt.length / 4), cacheRead: 0, cacheWrite: 0 })
+    await meter($, 'handoff', MAIN, { calls: 1, input: 0, output: Math.round(e.prompt.length / 4), cacheRead: 0, cacheWrite: 0 })
     const kb = (await readKb($)).trim().slice(0, KB_CHARS)
     const newer = kb !== '' && kb !== kbSnapshot.trim() // the system prompt has the session-start snapshot; send only a later change
     inAgent++
     const r = await next({ ...e, prompt: [e.prompt, `## User's message (verbatim)\n${userText}`, ...(newer ? [`## Knowledge base updates (newer than your system prompt)\n${kb}`] : [])].join('\n\n') }).finally(() => inAgent--)
-    reports.push(r.text ?? '')
     const call = e.tool_use_id ?? ''
     const id = agentOf.get(call) ?? ''
     agentOf.delete(call)
-    agents.delete(id)
+    idle.set(id, Date.now())
+    if (e.name) idle.set(e.name, Date.now())
     await update($, runs, list => list.filter(run => run.id !== id))
-    record($, 'agent', { model: modelOfTier(t), agent: id, detail: { tier: t, task: e.description, handoffChars: e.prompt.length, isError: !!r.isError, deny: r.deny } })
+    kbWrites = kbWrites.then(() => addFacts($, r.text ?? '')).catch(() => undefined)
+    await kbWrites
+    record($, 'agent', { model: modelOfRole(role), agent: id, detail: { role, task: e.description, handoffChars: e.prompt.length, isError: !!r.isError, deny: r.deny } })
     return r
   }).catch(($, e, next) => (next.called ? next(e) : { deny: 'model-router: agent routing failed.' }))
 
-  // After each main-chat answer the knowledge base is updated off the critical path; the chain keeps the writes in order.
-  on('turn.complete', ($, e, next) => {
-    if (!e.agentId && e.reason === 'answer') {
-      const [user, answer, notes] = [userText, e.answer, reports] as const
-      kbWrites = kbWrites.then(() => updateKb($, user, answer, notes)).catch(() => undefined)
-    }
-    return next(e)
-  })
-
-  // flush pending knowledge-base updates before the process exits (one-shot sessions end right after the answer)
-  on('session.end', async ($, e, next) => {
-    await kbWrites
-    return next(e)
-  })
-
-  // Agents are single-use: a finished agent is never resumed, so every session starts fresh.
-  on('tool.call', { tool: 'SendMessage' }, ($, e, next) =>
-    spent.has(String(e.to).split(' [')[0] ?? '')
-      ? { deny: 'model-router: agents are single-use. Spawn a fresh agent with a new handoff document.' }
-      : next(e),
-  )
+  // A finished agent can be resumed while its prompt cache is warm; later, a fresh agent is cheaper than re-writing its whole context.
+  on('tool.call', { tool: 'SendMessage' }, async ($, e, next) => {
+    const to = String(e.to).split(' [')[0] ?? ''
+    const at = idle.get(to)
+    if (at === undefined) return next(e)
+    if (Date.now() - at >= RESUME_MS)
+      return { deny: `model-router: this agent finished over ${Math.round(RESUME_MS / 60_000)} minutes ago, so its prompt cache is cold. Spawn a fresh agent with a new handoff document.` }
+    inAgent++
+    const r = await next(e).finally(() => inAgent--)
+    idle.set(to, Date.now())
+    return r
+  }).catch(($, e, next) => (next.called ? next(e) : { deny: 'model-router: agent routing failed.' }))
 
   // Every surface, VS Code included: a live pane with the router's state.
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text } = $.ui.resolve(e)
     const list = await read($, runs)
     const usage = Object.entries(await read($, today))
-    const last = await read($, route)
     return (
       <Box flexDirection="column">
         <Text bold color="green">● model-router active</Text>
-        <Text>front desk {label(SIMPLE)} · {SIMPLE_EFFORT}</Text>
-        <Text>medium     {label(MEDIUM)} · {MEDIUM_EFFORT}</Text>
-        <Text>complex    {label(COMPLEX)} · {COMPLEX_EFFORT}</Text>
-        <Text>classifier {label(CLASSIFIER)} · {CLASSIFIER_EFFORT}</Text>
-        <Text dimColor>today      {usage.map(([m, v]) => `${m} ${k(v)}`).join(' · ') || 'no usage yet'}</Text>
+        <Text>main    {label(MAIN)} · {MAIN_EFFORT}</Text>
+        <Text>worker  {label(WORKER)} · {WORKER_EFFORT}</Text>
+        <Text>advisor {label(ADVISOR)} · {ADVISOR_EFFORT}</Text>
+        <Text dimColor>today   {usage.map(([m, v]) => `${m} ${k(v)}`).join(' · ') || 'no usage yet'}</Text>
         {list.map(run => (
           <Text color="cyan">
-            {short(modelOfTier(run.tier))} ▸ {run.task}
+            {short(modelOfRole(run.role))} ▸ {run.task}
           </Text>
         ))}
-        {last !== '' && <Text dimColor>last route: {last}</Text>}
       </Box>
     )
   })
@@ -681,9 +602,9 @@ export const register: Register = on => {
   // Every surface, VS Code included: agent rows in the transcript name their model.
   on('ui.render', { component: 'ToolUse', props: { tool: 'Agent' } }, ($, e, next) => {
     const input = e.props.input as { subagent_type?: string; description?: string }
-    const t = tierOfType(input.subagent_type ?? '')
-    if (t === undefined) return next(e)
-    return next({ ...e, props: { ...e.props, input: { ...input, description: `${label(modelOfTier(t))} · ${input.description ?? ''}` } } })
+    const role = roleOfType(input.subagent_type ?? '')
+    if (role === undefined) return next(e)
+    return next({ ...e, props: { ...e.props, input: { ...input, description: `${label(modelOfRole(role))} · ${input.description ?? ''}` } } })
   })
 
   // the engine prefixes command output with "model-router: "; a leading blank line keeps the markdown's first line (a table or heading) intact on surfaces that render it as plain markdown

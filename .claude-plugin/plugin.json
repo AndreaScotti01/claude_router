@@ -1,7 +1,9 @@
 {
   "name": "model-router",
-  "version": "0.4.0",
-  "description": "Tiered model router: a Haiku 5.5 front desk classifies every message and routes it to Haiku, Sonnet 5.5 or Opus 5.5 with a scoped handoff; shared knowledge base; meters tokens per model.",
-  "author": { "name": "Andrea Scotti" },
+  "version": "0.5.0",
+  "description": "Model router: a steady Sonnet 5.5 main thread does the work; Haiku 5.5 workers take bulk reading and test runs; a read-only Opus 5.5 advisor reviews hard calls; shared knowledge base from agents' facts; meters tokens per model.",
+  "author": {
+    "name": "Andrea Scotti"
+  },
   "types": "./types/index.d.ts"
 }
